@@ -16,7 +16,10 @@ namespace bpftime
 {
 namespace attach
 {
-std::optional<syscall_trace_attach_impl *> global_syscall_trace_attach_impl;
+std::atomic<syscall_trace_attach_impl *> global_syscall_trace_attach_impl{
+	nullptr
+};
+std::atomic<syscall_hooker_func_t> global_orig_syscall{ nullptr };
 
 // pt_regs is provided by the shared base_attach_impl/bpftime_pt_regs.hpp
 // (x86_64/aarch64/riscv/arm), a single ABI layout source of truth.
@@ -423,9 +426,22 @@ extern "C" int64_t _bpftime__syscall_dispatcher(int64_t sys_nr, int64_t arg1,
 {
 	SPDLOG_DEBUG("Call syscall dispatcher: {} {}, {}, {}, {}, {}, {}",
 		     sys_nr, arg1, arg2, arg3, arg4, arg5, arg6);
-	return global_syscall_trace_attach_impl.value()->dispatch_syscall(
-		sys_nr, arg1, arg2, arg3, arg4, arg5, arg6, user_ip, user_sp,
-		user_bp);
+	// The trampoline keeps calling this after a teardown has cleared the
+	// instance, and it runs inside the host process with no exception
+	// boundary above it: load the instance once and run the original
+	// syscall when it is gone instead of throwing out of the trampoline.
+	auto *impl = global_syscall_trace_attach_impl.load(
+		std::memory_order_acquire);
+	if (impl == nullptr) {
+		auto orig = global_orig_syscall.load(std::memory_order_relaxed);
+		if (orig == nullptr) {
+			return -ENOSYS;
+		}
+		return orig(sys_nr, arg1, arg2, arg3, arg4, arg5, arg6,
+			    user_ip, user_sp, user_bp);
+	}
+	return impl->dispatch_syscall(sys_nr, arg1, arg2, arg3, arg4, arg5,
+				      arg6, user_ip, user_sp, user_bp);
 }
 
 extern "C" void
@@ -441,11 +457,14 @@ _bpftime__setup_syscall_hooker_callback(syscall_hooker_func_t *hooker)
 	if (hooker == nullptr) {
 		return;
 	}
-	if (!global_syscall_trace_attach_impl.has_value()) {
+	// One load, not has_value() followed by value(): a teardown between the
+	// two would throw std::bad_optional_access inside the host process.
+	auto *impl = global_syscall_trace_attach_impl.load(
+		std::memory_order_acquire);
+	if (impl == nullptr) {
 		return;
 	}
-	auto impl = global_syscall_trace_attach_impl.value();
-	impl->set_original_syscall_function(*hooker);
+	impl->publish_original_syscall(*hooker);
 	SPDLOG_DEBUG(
 		"Saved original syscall hooker (original syscall function): {:x}",
 		(uintptr_t)*hooker);
