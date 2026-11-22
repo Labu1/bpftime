@@ -3,11 +3,13 @@
  * Copyright (c) 2022, eunomia-bpf org
  * All rights reserved.
  */
+
 #include "bpf_map/userspace/lru_var_hash_map.hpp"
 #include "bpf_map/userspace/per_cpu_array_map.hpp"
 #include "bpf_map/userspace/per_cpu_hash_map.hpp"
 #include "bpf_map/userspace/stack_trace_map.hpp"
 #include "bpftime_shm_internal.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
@@ -15,6 +17,10 @@
 #include "bpf_map/gpu/nv_gpu_per_thread_array_map.hpp"
 #include "bpf_map/gpu/nv_gpu_shared_array_map.hpp"
 #include "bpf_map/gpu/nv_gpu_ringbuf_map.hpp"
+#include "bpf_map/gpu_kernel_shared/array_map_kernel_gpu.hpp"
+#include "bpf_map/gpu/nv_gpu_shared_hash_map.hpp"
+#include "bpf_map/gpu/nv_gpu_array_host_map.hpp"
+#include "bpf_map/gpu/nv_gpu_shared_array_host_map.hpp"
 #endif
 #include "bpf_map/userspace/lpm_trie_map.hpp"
 #include <bpf_map/userspace/perf_event_array_map.hpp>
@@ -45,20 +51,18 @@ using boost::interprocess::sharable_lock;
 namespace bpftime
 {
 
-#ifdef BPFTIME_USE_VAR_HASH_MAP
-using hash_map_impl = var_size_hash_map_impl;
-#else
 using hash_map_impl = fix_size_hash_map_impl;
-#endif
+
+namespace {
+// Stable per-thread slot for the syscall map-in-map inner fd. The 4-byte value
+// is copied here while map_lock is held, so the caller's subsequent memcpy
+// cannot read a hash node freed by a concurrent delete.
+thread_local int tl_map_in_map_fd_snapshot;
+} // namespace
 
 bpftime_map_ops global_map_ops_table[(int)bpf_map_type::BPF_MAP_TYPE_MAX] = {
 	{ 0 }
 };
-
-std::string bpf_map_handler::get_container_name() const
-{
-	return "ebpf_map_fd_" + std::string(name.c_str());
-}
 
 uint32_t bpf_map_handler::get_value_size() const
 {
@@ -72,10 +76,11 @@ uint32_t bpf_map_handler::get_userspace_value_size() const
 	    (type == bpf_map_type::BPF_MAP_TYPE_PERCPU_HASH)) {
 		result *= sysconf(_SC_NPROCESSORS_ONLN);
 	}
-	if (type == bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP) {
+	if (type == bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP ||
+	    type == bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP) {
 		result *= this->attr.gpu_thread_count;
 		SPDLOG_DEBUG(
-			"Value size of BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP is {}",
+			"Value size of BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP/HOST is {}",
 			result);
 	}
 	return result;
@@ -123,7 +128,16 @@ const void *bpf_map_handler::map_lookup_elem(const void *key,
 			return impl->elem_lookup_userspace(key);
 		}
 	};
-
+	// Var-size/LRU hash backends enforce BPF_F_RDONLY/BPF_F_WRONLY only
+	// for fd-based syscall access; BPF helpers call with from_syscall=false.
+	const auto do_lookup_with_origin = [&](auto *impl) -> const void * {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->elem_lookup(key, from_syscall);
+		} else {
+			return impl->elem_lookup(key, from_syscall);
+		}
+	};
 	switch (type) {
 	case bpf_map_type::BPF_MAP_TYPE_HASH: {
 		auto impl = static_cast<hash_map_impl *>(map_impl_ptr.get());
@@ -175,7 +189,7 @@ const void *bpf_map_handler::map_lookup_elem(const void *key,
 	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
 		auto impl = static_cast<lru_var_hash_map_impl *>(
 			map_impl_ptr.get());
-		return do_lookup(impl);
+		return do_lookup_with_origin(impl);
 	}
 	case bpf_map_type::BPF_MAP_TYPE_LPM_TRIE: {
 		auto impl =
@@ -212,9 +226,37 @@ const void *bpf_map_handler::map_lookup_elem(const void *key,
 	case bpf_map_type::BPF_MAP_TYPE_ARRAY_OF_MAPS: {
 		auto impl = static_cast<array_map_of_maps_impl *>(
 			map_impl_ptr.get());
-		return do_lookup(impl);
+		if (!from_syscall)
+			return do_lookup(impl);
+		bpftime_lock_guard guard(map_lock);
+		const int *stored =
+			static_cast<const int *>(impl->elem_lookup_userspace(key));
+		if (stored == nullptr)
+			return nullptr;
+		// Copy inside the lock; return thread-local stable storage so the
+		// caller's memcpy cannot touch a concurrently freed map node.
+		tl_map_in_map_fd_snapshot = *stored;
+		return &tl_map_in_map_fd_snapshot;
+	}
+	case bpf_map_type::BPF_MAP_TYPE_HASH_OF_MAPS: {
+		auto impl = static_cast<hash_map_of_maps_impl *>(
+			map_impl_ptr.get());
+		if (!from_syscall)
+			return do_lookup(impl);
+		bpftime_lock_guard guard(map_lock);
+		const int *stored =
+			static_cast<const int *>(impl->elem_lookup_userspace(key));
+		if (stored == nullptr)
+			return nullptr;
+		tl_map_in_map_fd_snapshot = *stored;
+		return &tl_map_in_map_fd_snapshot;
 	}
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	case bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP: {
+		auto impl = static_cast<nv_gpu_shared_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_lookup(impl);
+	}
 	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP: {
 		auto impl = static_cast<nv_gpu_per_thread_array_map_impl *>(
 			map_impl_ptr.get());
@@ -230,7 +272,22 @@ const void *bpf_map_handler::map_lookup_elem(const void *key,
 			map_impl_ptr.get());
 		return do_lookup(impl);
 	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP: {
+		auto impl = static_cast<array_map_kernel_gpu_impl *>(
+			map_impl_ptr.get());
+		return do_lookup(impl);
+	}
 
+	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_array_host_map_impl *>(
+			map_impl_ptr.get());
+		return do_lookup(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_shared_array_host_map_impl *>(
+			map_impl_ptr.get());
+		return do_lookup(impl);
+	}
 #endif
 	default:
 		auto func_ptr = global_map_ops_table[(int)type].elem_lookup;
@@ -263,6 +320,18 @@ long bpf_map_handler::map_update_elem(const void *key, const void *value,
 			return impl->elem_update_userspace(key, value, flags);
 		} else {
 			return impl->elem_update_userspace(key, value, flags);
+		}
+	};
+	// Var-size/LRU hash backends enforce BPF_F_RDONLY only for fd-based
+	// syscall access; BPF helpers call with from_syscall=false.
+	const auto do_update_with_origin = [&](auto *impl) -> long {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->elem_update(key, value, flags,
+						 from_syscall);
+		} else {
+			return impl->elem_update(key, value, flags,
+						 from_syscall);
 		}
 	};
 	switch (type) {
@@ -349,12 +418,26 @@ long bpf_map_handler::map_update_elem(const void *key, const void *value,
 			map_impl_ptr.get());
 		return do_update(impl);
 	}
-	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
-		auto impl = static_cast<lru_var_hash_map_impl *>(
+	case bpf_map_type::BPF_MAP_TYPE_HASH_OF_MAPS: {
+		if (!from_syscall) {
+			// Map in maps only support update from syscall
+			return -EINVAL;
+		}
+		auto impl = static_cast<hash_map_of_maps_impl *>(
 			map_impl_ptr.get());
 		return do_update(impl);
 	}
+	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
+		auto impl = static_cast<lru_var_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_update_with_origin(impl);
+	}
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	case bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP: {
+		auto impl = static_cast<nv_gpu_shared_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_update(impl);
+	}
 	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP: {
 		auto impl = static_cast<nv_gpu_per_thread_array_map_impl *>(
 			map_impl_ptr.get());
@@ -367,6 +450,21 @@ long bpf_map_handler::map_update_elem(const void *key, const void *value,
 	}
 	case bpf_map_type::BPF_MAP_TYPE_GPU_RINGBUF_MAP: {
 		auto impl = static_cast<nv_gpu_ringbuf_map_impl *>(
+			map_impl_ptr.get());
+		return do_update(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP: {
+		auto impl = static_cast<array_map_kernel_gpu_impl *>(
+			map_impl_ptr.get());
+		return do_update(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_array_host_map_impl *>(
+			map_impl_ptr.get());
+		return do_update(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_shared_array_host_map_impl *>(
 			map_impl_ptr.get());
 		return do_update(impl);
 	}
@@ -399,6 +497,18 @@ int bpf_map_handler::bpf_map_get_next_key(const void *key, void *next_key,
 			return impl->map_get_next_key(key, next_key);
 		} else {
 			return impl->map_get_next_key(key, next_key);
+		}
+	};
+	// Var-size/LRU hash backends enforce BPF_F_WRONLY only for fd-based
+	// syscall access; BPF helpers call with from_syscall=false.
+	const auto do_get_next_key_with_origin = [&](auto *impl) -> int {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->map_get_next_key(key, next_key,
+						      from_syscall);
+		} else {
+			return impl->map_get_next_key(key, next_key,
+						      from_syscall);
 		}
 	};
 	switch (type) {
@@ -479,12 +589,22 @@ int bpf_map_handler::bpf_map_get_next_key(const void *key, void *next_key,
 			map_impl_ptr.get());
 		return do_get_next_key(impl);
 	}
-	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
-		auto impl = static_cast<lru_var_hash_map_impl *>(
+	case bpf_map_type::BPF_MAP_TYPE_HASH_OF_MAPS: {
+		auto impl = static_cast<hash_map_of_maps_impl *>(
 			map_impl_ptr.get());
 		return do_get_next_key(impl);
 	}
+	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
+		auto impl = static_cast<lru_var_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_get_next_key_with_origin(impl);
+	}
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	case bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP: {
+		auto impl = static_cast<nv_gpu_shared_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_get_next_key(impl);
+	}
 	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP: {
 		auto impl = static_cast<nv_gpu_per_thread_array_map_impl *>(
 			map_impl_ptr.get());
@@ -497,6 +617,21 @@ int bpf_map_handler::bpf_map_get_next_key(const void *key, void *next_key,
 	}
 	case bpf_map_type::BPF_MAP_TYPE_GPU_RINGBUF_MAP: {
 		auto impl = static_cast<nv_gpu_ringbuf_map_impl *>(
+			map_impl_ptr.get());
+		return do_get_next_key(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP: {
+		auto impl = static_cast<array_map_kernel_gpu_impl *>(
+			map_impl_ptr.get());
+		return do_get_next_key(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_array_host_map_impl *>(
+			map_impl_ptr.get());
+		return do_get_next_key(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_shared_array_host_map_impl *>(
 			map_impl_ptr.get());
 		return do_get_next_key(impl);
 	}
@@ -537,6 +672,16 @@ long bpf_map_handler::map_delete_elem(const void *key, bool from_syscall) const
 			return impl->elem_delete_userspace(key);
 		} else {
 			return impl->elem_delete_userspace(key);
+		}
+	};
+	// Var-size/LRU hash backends enforce BPF_F_RDONLY only for fd-based
+	// syscall access; BPF helpers call with from_syscall=false.
+	const auto do_delete_with_origin = [&](auto *impl) -> long {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->elem_delete(key, from_syscall);
+		} else {
+			return impl->elem_delete(key, from_syscall);
 		}
 	};
 
@@ -624,12 +769,26 @@ long bpf_map_handler::map_delete_elem(const void *key, bool from_syscall) const
 			map_impl_ptr.get());
 		return do_delete(impl);
 	}
-	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
-		auto impl = static_cast<lru_var_hash_map_impl *>(
+	case bpf_map_type::BPF_MAP_TYPE_HASH_OF_MAPS: {
+		if (!from_syscall) {
+			// Map in maps only support update from syscall
+			return -EINVAL;
+		}
+		auto impl = static_cast<hash_map_of_maps_impl *>(
 			map_impl_ptr.get());
 		return do_delete(impl);
 	}
+	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
+		auto impl = static_cast<lru_var_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_delete_with_origin(impl);
+	}
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	case bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP: {
+		auto impl = static_cast<nv_gpu_shared_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_delete(impl);
+	}
 	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP: {
 		auto impl = static_cast<nv_gpu_per_thread_array_map_impl *>(
 			map_impl_ptr.get());
@@ -642,6 +801,21 @@ long bpf_map_handler::map_delete_elem(const void *key, bool from_syscall) const
 	}
 	case bpf_map_type::BPF_MAP_TYPE_GPU_RINGBUF_MAP: {
 		auto impl = static_cast<nv_gpu_ringbuf_map_impl *>(
+			map_impl_ptr.get());
+		return do_delete(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP: {
+		auto impl = static_cast<array_map_kernel_gpu_impl *>(
+			map_impl_ptr.get());
+		return do_delete(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_array_host_map_impl *>(
+			map_impl_ptr.get());
+		return do_delete(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP: {
+		auto impl = static_cast<nv_gpu_shared_array_host_map_impl *>(
 			map_impl_ptr.get());
 		return do_delete(impl);
 	}
@@ -679,18 +853,39 @@ static uint64_t get_thread_count(const bpf_map_attr &attr)
 
 int bpf_map_handler::map_init(managed_shared_memory &memory)
 {
-	auto container_name = get_container_name();
+#if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	static CUcontext context;
+	static CUdevice device;
+#endif
+
+	if (map_impl_ptr.get() != nullptr) {
+		return 0;
+	}
+
+	const auto init_refcnt = [&]() {
+		if (map_refcnt_ptr.get() == nullptr) {
+			map_refcnt_ptr =
+				memory.construct<map_refcount_t>(
+					boost::interprocess::anonymous_instance)(
+					1);
+		} else {
+			map_refcnt_ptr->store(1, std::memory_order_relaxed);
+		}
+	};
+
 	switch (type) {
 	case bpf_map_type::BPF_MAP_TYPE_HASH: {
-		map_impl_ptr =
-			memory.construct<hash_map_impl>(container_name.c_str())(
-				memory, max_entries, key_size, value_size);
+		map_impl_ptr = memory.construct<hash_map_impl>(
+			boost::interprocess::anonymous_instance)(
+			memory, max_entries, key_size, value_size);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_ARRAY: {
 		map_impl_ptr = memory.construct<array_map_impl>(
-			container_name.c_str())(memory, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_RINGBUF: {
@@ -704,40 +899,47 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 			SPDLOG_ERROR(
 				"Failed to create ringbuf map, max_entries must be a power of 2, current: {}",
 				max_entries);
-			return -1;
+			return -EINVAL;
 		}
 		map_impl_ptr = memory.construct<ringbuf_map_impl>(
-			container_name.c_str())(max_entries, memory);
+			boost::interprocess::anonymous_instance)(max_entries,
+								 memory);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY: {
 		map_impl_ptr = memory.construct<perf_event_array_map_impl>(
-			container_name.c_str())(memory, key_size, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY: {
 		map_impl_ptr = memory.construct<per_cpu_array_map_impl>(
-			container_name.c_str())(memory, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_PERCPU_HASH: {
 		map_impl_ptr = memory.construct<per_cpu_hash_map_impl>(
-			container_name.c_str())(memory, key_size, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_QUEUE: {
 		map_impl_ptr = memory.construct<queue_map_impl>(
-			container_name.c_str())(memory, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_STACK: {
 		map_impl_ptr = memory.construct<stack_map_impl>(
-			container_name.c_str())(memory, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_BLOOM_FILTER: {
@@ -745,7 +947,7 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 		if (key_size != 0) {
 			SPDLOG_ERROR("Bloom filter key_size must be 0, got {}",
 				     key_size);
-			return -1;
+			return -EINVAL;
 		}
 		// Extract nr_hashes from map_extra (lower 4 bits)
 		unsigned int nr_hashes =
@@ -760,66 +962,117 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 		BloomHashAlgorithm hash_algo = BloomHashAlgorithm::JHASH;
 
 		map_impl_ptr = memory.construct<bloom_filter_map_impl>(
-			container_name.c_str())(memory, value_size, max_entries,
-						nr_hashes, hash_algo);
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries, nr_hashes, hash_algo);
+		init_refcnt();
 		return 0;
 	}
+
 #ifdef BPFTIME_BUILD_WITH_LIBBPF
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_ARRAY: {
 		map_impl_ptr = memory.construct<array_map_kernel_user_impl>(
-			container_name.c_str())(memory, attr.kernel_bpf_map_id);
+			boost::interprocess::anonymous_instance)(
+			memory, attr.kernel_bpf_map_id, value_size,
+			max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_HASH: {
 		map_impl_ptr = memory.construct<hash_map_kernel_user_impl>(
-			container_name.c_str())(memory, attr.kernel_bpf_map_id);
+			boost::interprocess::anonymous_instance)(
+			memory, attr.kernel_bpf_map_id);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_PERCPU_ARRAY: {
 		map_impl_ptr =
 			memory.construct<percpu_array_map_kernel_user_impl>(
-				container_name.c_str())(memory,
-							attr.kernel_bpf_map_id);
+				boost::interprocess::anonymous_instance)(
+				memory, attr.kernel_bpf_map_id);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_PERF_EVENT_ARRAY: {
 		map_impl_ptr =
 			memory.construct<perf_event_array_kernel_user_impl>(
-				container_name.c_str())(
+				boost::interprocess::anonymous_instance)(
 				memory, 4, 4, sysconf(_SC_NPROCESSORS_ONLN),
 				attr.kernel_bpf_map_id);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_PROG_ARRAY: {
 		map_impl_ptr = memory.construct<prog_array_map_impl>(
-			container_name.c_str())(memory, key_size, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_STACK_TRACE: {
 		map_impl_ptr = memory.construct<stack_trace_map_impl>(
-			container_name.c_str())(memory, key_size, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 #endif
 	case bpf_map_type::BPF_MAP_TYPE_ARRAY_OF_MAPS: {
+		// inner fd is stored as a uint32; reject mismatched value_size so
+		// the syscall memcpy path can never over-read/truncate (M13 follow-up).
+		if (value_size != sizeof(uint32_t))
+			return -EINVAL;
 		map_impl_ptr = memory.construct<array_map_of_maps_impl>(
-			container_name.c_str())(memory, max_entries);
+			boost::interprocess::anonymous_instance)(memory,
+								 max_entries);
+		init_refcnt();
+		return 0;
+	}
+	case bpf_map_type::BPF_MAP_TYPE_HASH_OF_MAPS: {
+		if (value_size != sizeof(uint32_t))
+			return -EINVAL;
+		map_impl_ptr = memory.construct<hash_map_of_maps_impl>(
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, max_entries,
+			static_cast<uint32_t>(flags));
+		init_refcnt();
 		return 0;
 	}
 	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
 		map_impl_ptr = memory.construct<lru_var_hash_map_impl>(
-			container_name.c_str())(memory, key_size, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, value_size, max_entries,
+			static_cast<uint32_t>(flags));
+		init_refcnt();
 		return 0;
 	}
 
 	// TODO: Move these CUDA sentences to a more appropriate position
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
-
-		static CUcontext context;
-		static CUdevice device;
+	case bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP: {
+		shm_holder.global_shared_memory.set_enable_mock(false);
+		if (!device) {
+			cuDeviceGet(&device, 0);
+#if CUDA_VERSION >= 13000
+			// CUDA 13.0+ uses 4-parameter cuCtxCreate_v4
+			cuCtxCreate(&context, nullptr, 0, device);
+#else
+			// CUDA 12.x and earlier use 3-parameter cuCtxCreate
+			cuCtxCreate(&context, 0, device);
+#endif
+			SPDLOG_INFO(
+				"CUDA context for thread {} has been set to {:x}",
+				gettid(), (uintptr_t)context);
+		}
+		SPDLOG_INFO(
+			"Map {} (nv_gpu_shared_hash_map_impl) shared hashmap",
+			name.c_str());
+		map_impl_ptr = memory.construct<nv_gpu_shared_hash_map_impl>(
+			boost::interprocess::anonymous_instance)(
+			memory, max_entries, key_size, value_size);
+		init_refcnt();
+		shm_holder.global_shared_memory.set_enable_mock(true);
+		return 0;
+	}
 	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP: {
 		shm_holder.global_shared_memory.set_enable_mock(false);
 		if (!device) {
@@ -839,11 +1092,12 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 		auto thread_count = get_thread_count(attr);
 		SPDLOG_INFO(
 			"Map {} (nv_gpu_per_thread_array_map_impl) has space for thread count {}",
-			container_name.c_str(), thread_count);
+			name.c_str(), thread_count);
 		map_impl_ptr =
 			memory.construct<nv_gpu_per_thread_array_map_impl>(
-				container_name.c_str())(
+				boost::interprocess::anonymous_instance)(
 				memory, value_size, max_entries, thread_count);
+		init_refcnt();
 		shm_holder.global_shared_memory.set_enable_mock(true);
 		return 0;
 	}
@@ -851,17 +1105,45 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 		shm_holder.global_shared_memory.set_enable_mock(false);
 		if (!device) {
 			cuDeviceGet(&device, 0);
+#if CUDA_VERSION >= 13000
+			cuCtxCreate(&context, nullptr, 0, device);
+#else
 			cuCtxCreate(&context, 0, device);
+#endif
 			SPDLOG_INFO(
 				"CUDA context for thread {} has been set to {:x}",
 				gettid(), (uintptr_t)context);
 		}
 		SPDLOG_INFO(
 			"Map {} (nv_gpu_shared_array_map_impl) shared array",
-			container_name.c_str());
+			name.c_str());
 		map_impl_ptr = memory.construct<nv_gpu_shared_array_map_impl>(
-			container_name.c_str())(memory, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries);
+		init_refcnt();
+		shm_holder.global_shared_memory.set_enable_mock(true);
+		return 0;
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP: {
+		shm_holder.global_shared_memory.set_enable_mock(false);
+		if (!device) {
+			cuDeviceGet(&device, 0);
+#if CUDA_VERSION >= 13000
+			cuCtxCreate(&context, nullptr, 0, device);
+#else
+			cuCtxCreate(&context, 0, device);
+#endif
+			SPDLOG_INFO(
+				"CUDA context for thread {} has been set to {:x}",
+				gettid(), (uintptr_t)context);
+		}
+		SPDLOG_INFO("Map {} (array_map_kernel_gpu_impl) shared array",
+			    name.c_str());
+		map_impl_ptr = memory.construct<array_map_kernel_gpu_impl>(
+			boost::interprocess::anonymous_instance)(
+			memory, attr.kernel_bpf_map_id, value_size,
+			max_entries);
+		init_refcnt();
 		shm_holder.global_shared_memory.set_enable_mock(true);
 		return 0;
 	}
@@ -883,22 +1165,67 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 		auto thread_count = get_thread_count(attr);
 		SPDLOG_INFO(
 			"Map {} (nv_gpu_ringbuf_map_impl) has space for thread count {}",
-			container_name.c_str(), thread_count);
-		map_impl_ptr = memory.construct<nv_gpu_ringbuf_map_impl>(
-			container_name.c_str())(memory, value_size, max_entries,
-						thread_count);
+			name.c_str(), thread_count);
+		const uint64_t requested_thread_count = thread_count;
+		while (thread_count > 0) {
+			try {
+				map_impl_ptr = memory.construct<
+					nv_gpu_ringbuf_map_impl>(
+					boost::interprocess::anonymous_instance)(
+					memory, value_size, max_entries,
+					thread_count);
+				break;
+			} catch (const boost::interprocess::bad_alloc &) {
+				if (thread_count <= 1) {
+					shm_holder.global_shared_memory
+						.set_enable_mock(true);
+					throw;
+				}
+				thread_count = std::max<uint64_t>(
+					1, thread_count / 2);
+			}
+		}
+		if (thread_count != requested_thread_count) {
+			SPDLOG_WARN(
+				"Clamped GPU ringbuf thread count from {} to {} due to shared memory pressure; override via BPFTIME_MAP_GPU_THREAD_COUNT",
+				requested_thread_count, thread_count);
+		}
+		init_refcnt();
 		shm_holder.global_shared_memory.set_enable_mock(true);
+		return 0;
+	}
+	// HOST versions: use boost::interprocess + cudaHostRegister (for Tegra)
+	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP: {
+		SPDLOG_INFO(
+			"Map {} (nv_gpu_array_host_map_impl) has space for thread count {}",
+			name.c_str(), attr.gpu_thread_count);
+		map_impl_ptr = memory.construct<nv_gpu_array_host_map_impl>(
+			boost::interprocess::anonymous_instance)(
+			memory, value_size, max_entries, attr.gpu_thread_count);
+		init_refcnt();
+		return 0;
+	}
+	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP: {
+		SPDLOG_INFO(
+			"Map {} (nv_gpu_shared_array_host_map_impl) shared array",
+			name.c_str());
+		map_impl_ptr =
+			memory.construct<nv_gpu_shared_array_host_map_impl>(
+				boost::interprocess::anonymous_instance)(
+				memory, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 #endif
 	case bpf_map_type::BPF_MAP_TYPE_LPM_TRIE: {
 		map_impl_ptr = memory.construct<lpm_trie_map_impl>(
-			container_name.c_str())(memory, key_size, value_size,
-						max_entries);
+			boost::interprocess::anonymous_instance)(
+			memory, key_size, value_size, max_entries);
+		init_refcnt();
 		return 0;
 	}
 	default:
-		if (bpftime_get_agent_config().allow_non_buildin_map_types) {
+		if (bpftime_get_runtime_config().allow_non_buildin_map_types) {
 			SPDLOG_INFO("non-builtin map type: {}", (int)type);
 			map_impl_ptr = nullptr;
 			auto func_ptr =
@@ -910,7 +1237,7 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 		} else {
 			SPDLOG_ERROR("[map_init] Unsupported map type: {}",
 				     (int)type);
-			return -1;
+			return -EOPNOTSUPP;
 		}
 	}
 	return 0;
@@ -918,80 +1245,118 @@ int bpf_map_handler::map_init(managed_shared_memory &memory)
 
 void bpf_map_handler::map_free(managed_shared_memory &memory) const
 {
-	auto container_name = get_container_name();
+	if (map_impl_ptr.get() == nullptr) {
+		return;
+	}
+	void *impl = map_impl_ptr.get();
+
+	if (map_refcnt_ptr.get() != nullptr) {
+		auto prev = map_refcnt_ptr->fetch_sub(1,
+						      std::memory_order_acq_rel);
+		if (prev > 1) {
+			map_impl_ptr = nullptr;
+			map_refcnt_ptr = nullptr;
+			return;
+		}
+		memory.destroy_ptr(map_refcnt_ptr.get());
+		map_refcnt_ptr = nullptr;
+	}
+
 	switch (type) {
 	case bpf_map_type::BPF_MAP_TYPE_HASH:
-		memory.destroy<hash_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<hash_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_ARRAY:
-		memory.destroy<array_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<array_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_RINGBUF:
-		memory.destroy<ringbuf_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<ringbuf_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_PERF_EVENT_ARRAY:
-		memory.destroy<perf_event_array_map_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<perf_event_array_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_PERCPU_ARRAY:
-		memory.destroy<per_cpu_array_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<per_cpu_array_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_PERCPU_HASH:
-		memory.destroy<per_cpu_hash_map_impl>(container_name.c_str());
-		break;
-	case bpf_map_type::BPF_MAP_TYPE_STACK_TRACE:
-		memory.destroy<stack_trace_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<per_cpu_hash_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_QUEUE:
-		memory.destroy<queue_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<queue_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_STACK:
-		memory.destroy<stack_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<stack_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_BLOOM_FILTER:
-		memory.destroy<bloom_filter_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<bloom_filter_map_impl *>(impl));
 		break;
 #ifdef BPFTIME_BUILD_WITH_LIBBPF
+	case bpf_map_type::BPF_MAP_TYPE_STACK_TRACE:
+		memory.destroy_ptr(static_cast<stack_trace_map_impl *>(impl));
+		break;
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_ARRAY:
-		memory.destroy<array_map_kernel_user_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<array_map_kernel_user_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_HASH:
-		memory.destroy<hash_map_kernel_user_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<hash_map_kernel_user_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_PERCPU_ARRAY:
-		memory.destroy<percpu_array_map_kernel_user_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<percpu_array_map_kernel_user_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_PERF_EVENT_ARRAY:
-		memory.destroy<perf_event_array_kernel_user_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<perf_event_array_kernel_user_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_PROG_ARRAY:
-		memory.destroy<prog_array_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<prog_array_map_impl *>(impl));
+		break;
+#endif
+	case bpf_map_type::BPF_MAP_TYPE_ARRAY_OF_MAPS:
+		memory.destroy_ptr(static_cast<array_map_of_maps_impl *>(impl));
+		break;
+	case bpf_map_type::BPF_MAP_TYPE_HASH_OF_MAPS:
+		memory.destroy_ptr(static_cast<hash_map_of_maps_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH:
-		memory.destroy<lru_var_hash_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<lru_var_hash_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_LPM_TRIE:
-		memory.destroy<lpm_trie_map_impl>(container_name.c_str());
+		memory.destroy_ptr(static_cast<lpm_trie_map_impl *>(impl));
 		break;
-
-#endif
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	case bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP:
+		memory.destroy_ptr(
+			static_cast<nv_gpu_shared_hash_map_impl *>(impl));
+		break;
 	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP:
-		memory.destroy<nv_gpu_per_thread_array_map_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<nv_gpu_per_thread_array_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_MAP:
-		memory.destroy<nv_gpu_shared_array_map_impl>(
-			container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<nv_gpu_shared_array_map_impl *>(impl));
 		break;
 	case bpf_map_type::BPF_MAP_TYPE_GPU_RINGBUF_MAP:
-		memory.destroy<nv_gpu_ringbuf_map_impl>(container_name.c_str());
+		memory.destroy_ptr(
+			static_cast<nv_gpu_ringbuf_map_impl *>(impl));
 		break;
-
+	case bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP: {
+		memory.destroy_ptr(
+			static_cast<array_map_kernel_gpu_impl *>(impl));
+		break;
+	}
+	case bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP:
+		memory.destroy_ptr(
+			static_cast<nv_gpu_array_host_map_impl *>(impl));
+		break;
+	case bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP:
+		memory.destroy_ptr(
+			static_cast<nv_gpu_shared_array_host_map_impl *>(impl));
+		break;
 #endif
 	default:
 		auto func_ptr = global_map_ops_table[(int)type].map_free;
@@ -1003,6 +1368,7 @@ void bpf_map_handler::map_free(managed_shared_memory &memory) const
 		}
 	}
 	map_impl_ptr = nullptr;
+	map_refcnt_ptr = nullptr;
 	return;
 }
 std::optional<stack_trace_map_impl *>
@@ -1022,7 +1388,7 @@ bpf_map_handler::try_get_shared_perf_event_array_map_impl() const
 }
 uint64_t bpf_map_handler::get_gpu_map_max_thread_count() const
 {
-#if !defined(BPFTIME_ENABLE_CUDA_ATTACH) && !defined(BPFTIME_ENABLE_ROCM_ATTACH)
+#if !defined(BPFTIME_ENABLE_CUDA_ATTACH)
 	return 0;
 #endif
 
@@ -1032,7 +1398,8 @@ uint64_t bpf_map_handler::get_gpu_map_max_thread_count() const
 			       map_impl_ptr.get())
 			->get_max_thread_count();
 	}
-	if (this->type == bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_MAP) {
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_MAP ||
+	    this->type == bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP) {
 		return 1;
 	}
 	if (this->type == bpf_map_type::BPF_MAP_TYPE_GPU_RINGBUF_MAP) {
@@ -1041,6 +1408,20 @@ uint64_t bpf_map_handler::get_gpu_map_max_thread_count() const
 			->get_max_thread_count();
 	}
 
+#ifdef BPFTIME_BUILD_WITH_LIBBPF
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_KERNEL_USER_ARRAY) {
+		return 1;
+	}
+#endif
+
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP) {
+		return static_cast<nv_gpu_array_host_map_impl *>(
+			       map_impl_ptr.get())
+			->get_max_thread_count();
+	}
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP) {
+		return 1;
+	}
 #endif
 
 	SPDLOG_DEBUG("Not a GPU map!");
@@ -1048,11 +1429,16 @@ uint64_t bpf_map_handler::get_gpu_map_max_thread_count() const
 }
 void *bpf_map_handler::get_gpu_map_extra_buffer() const
 {
-#if !defined(BPFTIME_ENABLE_CUDA_ATTACH) && !defined(BPFTIME_ENABLE_ROCM_ATTACH)
+#if !defined(BPFTIME_ENABLE_CUDA_ATTACH)
 	return nullptr;
 #endif
 
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_GPU_HASH_MAP) {
+		return (void *)static_cast<nv_gpu_shared_hash_map_impl *>(
+			       map_impl_ptr.get())
+			->get_gpu_mem_buffer();
+	}
 	if (this->type == bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_MAP) {
 		return (void *)static_cast<nv_gpu_per_thread_array_map_impl *>(
 			       map_impl_ptr.get())
@@ -1068,7 +1454,22 @@ void *bpf_map_handler::get_gpu_map_extra_buffer() const
 			       map_impl_ptr.get())
 			->get_gpu_mem_buffer();
 	}
-
+	if (this->type ==
+	    bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP) {
+		return (void *)static_cast<array_map_kernel_gpu_impl *>(
+			       map_impl_ptr.get())
+			->try_initialize_for_agent_and_get_mapped_address();
+	}
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_PERGPUTD_ARRAY_HOST_MAP) {
+		return (void *)static_cast<nv_gpu_array_host_map_impl *>(
+			       map_impl_ptr.get())
+			->get_gpu_mem_buffer();
+	}
+	if (this->type == bpf_map_type::BPF_MAP_TYPE_GPU_ARRAY_HOST_MAP) {
+		return (void *)static_cast<nv_gpu_shared_array_host_map_impl *>(
+			       map_impl_ptr.get())
+			->get_gpu_mem_buffer();
+	}
 #endif
 
 	SPDLOG_WARN("Not a GPU map!");
@@ -1142,6 +1543,78 @@ long bpf_map_handler::map_pop_elem(void *value, bool from_syscall) const
 		SPDLOG_ERROR("map_pop_elem not supported for map type: {}",
 			     (int)type);
 		return -ENOTSUP;
+	}
+}
+
+long bpf_map_handler::map_lookup_and_delete_elem(const void *key, void *value,
+						 bool from_syscall) const
+{
+	// The kernel dispatches by map type: queue/stack take the keyless pop
+	// path, the hash variants (HASH, PERCPU_HASH, LRU_HASH,
+	// LRU_PERCPU_HASH, STACK_TRACE) take a keyed lookup-then-delete. See
+	// map_lookup_and_delete_elem() in kernel/bpf/syscall.c.
+	const auto do_lookup_and_delete = [&](auto *impl) -> long {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->lookup_and_delete(key, value, from_syscall);
+		} else {
+			return impl->lookup_and_delete(key, value, from_syscall);
+		}
+	};
+	const auto do_lookup_and_delete_userspace = [&](auto *impl)
+		-> long {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->lookup_and_delete_userspace(key, value);
+		} else {
+			return impl->lookup_and_delete_userspace(key, value);
+		}
+	};
+	// Queue and stack take the keyless pop, and both declare
+	// should_lock = true: the handler owns their lock.
+	const auto do_pop = [&](auto *impl) -> long {
+		if (impl->should_lock) {
+			bpftime_lock_guard guard(map_lock);
+			return impl->map_pop_elem(value);
+		} else {
+			return impl->map_pop_elem(value);
+		}
+	};
+
+	switch (type) {
+	case bpf_map_type::BPF_MAP_TYPE_HASH: {
+		auto impl = static_cast<hash_map_impl *>(map_impl_ptr.get());
+		return do_lookup_and_delete(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_PERCPU_HASH: {
+		auto impl = static_cast<per_cpu_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_lookup_and_delete_userspace(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_LRU_HASH: {
+		auto impl = static_cast<lru_var_hash_map_impl *>(
+			map_impl_ptr.get());
+		return do_lookup_and_delete(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_STACK_TRACE: {
+		auto impl =
+			static_cast<stack_trace_map_impl *>(map_impl_ptr.get());
+		return do_lookup_and_delete(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_QUEUE: {
+		auto impl = static_cast<queue_map_impl *>(map_impl_ptr.get());
+		return do_pop(impl);
+	}
+	case bpf_map_type::BPF_MAP_TYPE_STACK: {
+		auto impl = static_cast<stack_map_impl *>(map_impl_ptr.get());
+		return do_pop(impl);
+	}
+	default:
+		SPDLOG_ERROR(
+			"map_lookup_and_delete_elem not supported for map type: {}",
+			(int)type);
+		errno = ENOTSUP;
+		return -1;
 	}
 }
 

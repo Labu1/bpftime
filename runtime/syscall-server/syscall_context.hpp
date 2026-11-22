@@ -5,9 +5,9 @@
  */
 #ifndef _SYSCALL_CONTEXT_HPP
 #define _SYSCALL_CONTEXT_HPP
-#include <cassert>
+#include <set>
 #include <unordered_map>
-#if __linux__
+#if defined(__linux__)
 #include "linux/perf_event.h"
 #elif __APPLE__
 #include "bpftime_epoll.h"
@@ -19,7 +19,11 @@
 #include <spdlog/spdlog.h>
 #include <unordered_set>
 #include <pthread.h>
+#include <atomic>
 #include <future>
+#include <mutex>
+#include <stdexcept>
+#include <string>
 #include <thread>
 // #include "pos/include/common.h"
 // #include "pos/include/utils/command_caller.h"
@@ -90,92 +94,92 @@ class syscall_context {
 	pthread_spinlock_t mocked_file_lock;
 	std::unordered_map<int, std::unique_ptr<mocked_file_provider>>
 		mocked_files;
+	std::mutex map_in_map_refs_mutex;
+	std::unordered_map<int, std::unordered_map<std::string, int>>
+		map_in_map_refs;
 	void init_original_functions()
 	{
+		auto require_symbol = [](const char *name) {
+			void *symbol = dlsym(RTLD_NEXT, name);
+			if (symbol == nullptr)
+				throw std::runtime_error(
+					std::string(
+						"Unable to resolve original ") +
+					name);
+			return symbol;
+		};
+
 		orig_epoll_wait_fn =
-			(epoll_wait_fn)dlsym(RTLD_NEXT, "epoll_wait");
-		assert(orig_epoll_wait_fn != nullptr);
-		orig_epoll_ctl_fn = (epoll_ctl_fn)dlsym(RTLD_NEXT, "epoll_ctl");
-		assert(orig_epoll_ctl_fn != nullptr);
+			(epoll_wait_fn)require_symbol("epoll_wait");
+		orig_epoll_ctl_fn = (epoll_ctl_fn)require_symbol("epoll_ctl");
 		orig_epoll_create1_fn =
-			(epoll_craete1_fn)dlsym(RTLD_NEXT, "epoll_create1");
-		assert(orig_epoll_create1_fn != nullptr);
-		orig_ioctl_fn = (ioctl_fn)dlsym(RTLD_NEXT, "ioctl");
-		assert(orig_ioctl_fn != nullptr);
-		orig_syscall_fn = (syscall_fn)dlsym(RTLD_NEXT, "syscall");
-		assert(orig_syscall_fn != nullptr);
-		// orig_mmap64_fn = (mmap64_fn)dlsym(RTLD_NEXT, "mmap64");
-		// assert(orig_mmap64_fn != nullptr);
-		orig_close_fn = (close_fn)dlsym(RTLD_NEXT, "close");
-		assert(orig_close_fn != nullptr);
-		orig_munmap_fn = (munmap_fn)dlsym(RTLD_NEXT, "munmap");
-		assert(orig_munmap_fn != nullptr);
-		orig_mmap64_fn = orig_mmap_fn =
-			(mmap_fn)dlsym(RTLD_NEXT, "mmap");
-		assert(orig_mmap_fn != nullptr);
-		assert(orig_mmap64_fn != nullptr);
-		orig_openat_fn = (openat_fn)dlsym(RTLD_NEXT, "openat");
-		assert(orig_openat_fn != nullptr);
-		orig_open_fn = (open_fn)dlsym(RTLD_NEXT, "open");
-		assert(orig_open_fn != nullptr);
-		orig_read_fn = (read_fn)dlsym(RTLD_NEXT, "read");
-		assert(orig_read_fn != nullptr);
+			(epoll_craete1_fn)require_symbol("epoll_create1");
+		orig_ioctl_fn = (ioctl_fn)require_symbol("ioctl");
+		orig_syscall_fn = (syscall_fn)require_symbol("syscall");
+		orig_close_fn = (close_fn)require_symbol("close");
+		orig_munmap_fn = (munmap_fn)require_symbol("munmap");
+		orig_mmap_fn = (mmap_fn)require_symbol("mmap");
+		orig_mmap64_fn = (mmap64_fn)orig_mmap_fn;
+		orig_openat_fn = (openat_fn)require_symbol("openat");
+		orig_open_fn = (open_fn)require_symbol("open");
+		orig_read_fn = (read_fn)require_symbol("read");
 		orig_fopen_fn = (fopen_fn)dlsym(RTLD_NEXT, "fopen");
 		if (orig_fopen_fn == nullptr)
 			orig_fopen_fn = (fopen_fn)dlsym(RTLD_NEXT, "fopen64");
-		assert(orig_fopen_fn != nullptr);
+		if (orig_fopen_fn == nullptr)
+			throw std::runtime_error(
+				"Unable to resolve original fopen");
 
 		// To avoid polluting other child processes,
 		// unset the LD_PRELOAD env var after syscall context being
 		// initialized
 		unsetenv("LD_PRELOAD");
-		SPDLOG_DEBUG(
-			"Function addrs: {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}",
-			(uintptr_t)orig_epoll_wait_fn,
-			(uintptr_t)orig_epoll_ctl_fn,
-			(uintptr_t)orig_epoll_create1_fn,
-			(uintptr_t)orig_ioctl_fn, (uintptr_t)orig_syscall_fn,
-			(uintptr_t)orig_mmap64_fn, (uintptr_t)orig_close_fn,
-			(uintptr_t)orig_munmap_fn, (uintptr_t)orig_mmap_fn,
-			(uintptr_t)orig_openat_fn, (uintptr_t)orig_open_fn,
-			(uintptr_t)orig_fopen_fn);
 	}
 
-	int create_kernel_bpf_map(int fd);
+	int create_kernel_bpf_map(int fd, int bpftime_map_type);
 	int create_kernel_bpf_prog_in_userspace(int cmd, union bpf_attr *attr,
 						size_t size);
 	// try loading the bpf syscall helpers.
 	// if the syscall original function is not prepared, it will cause a
 	// segfault.
-	void try_startup();
+	// try_startup() is public: see the declaration near the ctor.
+	bool mock_enabled_for_current_thread() const noexcept;
+	// Single gate every mocked handler checks before emulating a syscall:
+	// mocking is active only when enabled for this thread, CUDA is not being
+	// initialized, and post-initialization mocking is still on. Handlers
+	// must call this instead of re-reading the three conditions separately.
+	bool mock_active_for_current_thread() const noexcept;
 
 	// enable userspace eBPF runing with kernel eBPF.
 	bool run_with_kernel = false;
-	// pos_cli result
-	// std::string pos_result = "";
-	// std::thread pos_thread{};
-	// std::promise<pos_retval_t> pos_thread_promise{};
-	// std::future<pos_retval_t> pos_thread_future{};
 	// allow programs to by pass the verifier
 	// some extensions are not supported by the verifier, so we need to
 	// by pass the verifier to make it work.
 	std::string by_pass_kernel_verifier_pattern;
 
 	void load_config_from_env();
+	long handle_map_update(int fd, const void *key, const void *value,
+			       uint64_t flags);
+	long handle_map_delete(int fd, const void *key);
+	void release_map_in_map_refs(int outer_fd);
+	void release_owned_map_fd(int fd);
 
     public:
 	// enable mock the syscall behavior in userspace
-	bool enable_mock = true;
+	std::atomic<bool> enable_mock{ true };
 	// Initializing CUDA
-	bool initializing_cuda = false;
+	std::atomic<bool> initializing_cuda{ false };
 	// Whether enable mock after syscall server has been initialized
-	bool enable_mock_after_initialized = true;
+	std::atomic<bool> enable_mock_after_initialized{ true };
 	syscall_context();
-	virtual ~syscall_context()
-	{
-		pthread_spin_destroy(&this->mocked_file_lock);
-	}
+	virtual ~syscall_context();
 	syscall_fn orig_syscall_fn = nullptr;
+	// Public, recursion-safe one-time startup. It holds mock_disable_depth for
+	// its whole duration so the SHM/mmap syscalls issued during initialization
+	// hit the real libc instead of re-entering interposed handlers (which would
+	// deadlock on the same std::call_once). Use this, never start_up()
+	// directly, when pre-warming before installing the seccomp filter.
+	void try_startup();
 
 	// handle syscall
 	int handle_close(int);
@@ -199,9 +203,11 @@ class syscall_context {
 	ssize_t handle_read(int fd, void *buf, size_t count);
 	FILE *handle_fopen(const char *pathname, const char *flags);
 	int handle_dup3(int oldfd, int newfd, int flags);
+	long handle_fcntl(int fd, int cmd, unsigned long arg);
 	int handle_memfd_create(const char *name, int flags);
 
 #if defined(BPFTIME_ENABLE_CUDA_ATTACH)
+	void initialize_cuda();
 	int poll_gpu_ringbuf_map(int mapfd, void *ctx,
 
 				 void (*)(const void *, uint64_t, void *));

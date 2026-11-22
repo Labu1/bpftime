@@ -17,7 +17,18 @@
 #include <boost/interprocess/allocators/allocator.hpp>
 #include <unistd.h>
 #include <spdlog/fmt/bin_to_hex.h>
+#include <atomic>
+#include <cerrno>
+#include <exception>
+#include <limits>
+#include <type_traits>
 #include <variant>
+#if __linux__
+#include <pthread.h>
+#include <sys/syscall.h>
+#elif __APPLE__
+#include <pthread.h>
+#endif
 
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 
@@ -50,12 +61,191 @@
 		asm volatile("ldar %0, %1" : "=r"(___p) : "Q"(*p) : "memory"); \
 		___p;                                                          \
 	})
+#elif defined(__riscv)
+#define smp_store_release_u64(p, v)                                            \
+	do {                                                                   \
+		asm volatile("fence rw,w" ::: "memory");                       \
+		WRITE_ONCE_U64(*p, v);                                         \
+	} while (0)
+#define smp_load_acquire_u64(p)                                                \
+	({                                                                     \
+		uint64_t ___p = READ_ONCE_U64(*p);                             \
+		asm volatile("fence r,rw" ::: "memory");                       \
+		___p;                                                          \
+	})
 #else
-#error Only supports x86_64 and aarch64
+#error Unsupported architecture
 #endif
 
 namespace bpftime
 {
+namespace
+{
+struct spin_lock_guard {
+	pthread_spinlock_t &lock;
+	explicit spin_lock_guard(pthread_spinlock_t &lock) : lock(lock)
+	{
+		pthread_spin_lock(&lock);
+	}
+	~spin_lock_guard()
+	{
+		pthread_spin_unlock(&lock);
+	}
+	spin_lock_guard(const spin_lock_guard &) = delete;
+	spin_lock_guard &operator=(const spin_lock_guard &) = delete;
+};
+
+#if __linux__
+// gettid() has not been cached by glibc since 2.25, so every software perf
+// output paid a real gettid syscall before the shard cache was even looked
+// up. Cache it in thread-local storage: a cache hit is then a single TLS
+// load, never a syscall, on the hot path. The value is a trivial int64_t, so
+// no destructor is registered (the output path must stay allocation-free,
+// see #726).
+//
+// The storage model is initial-exec, not default global-dynamic: this file is
+// part of the runtime target, which is compiled with
+// `-ftls-model=initial-exec` (runtime/CMakeLists.txt), so the compiler emits
+// a direct %fs-relative access with no __tls_get_addr call. That removes the
+// dynamic-linker lookup from the hot path, at the cost of 8 bytes of static
+// TLS per thread counted against the same surplus budget #726 shrank its shard
+// cache for. Keep this variable small for that reason.
+//
+// Boundaries:
+//  - An initial-exec access is async-signal-safe, but software perf output
+//    (helper 25) is still not in the trap backend's audited helper set
+//    (helper_is_async_signal_safe in bpf_helper.cpp), so it never runs in
+//    SIGTRAP context; admitting it there would require a new audit.
+//  - pthread_atfork covers fork/pthread_create/posix_spawn (the last execs
+//    immediately). A raw clone()/vfork() that bypasses pthread_atfork is not
+//    a supported runtime entry; such a child must not call this helper.
+//  - The -1 sentinel cannot collide with a real tid, which is always
+//    positive.
+
+thread_local int64_t bpftime_cached_tid = -1;
+
+void bpftime_refresh_cached_tid_in_child()
+{
+	// Only the forking thread survives in the child, but its TLS copy still
+	// carries the parent's tid; force the next call to resolve the child's.
+	bpftime_cached_tid = -1;
+}
+
+const int bpftime_tid_atfork_status =
+	pthread_atfork(nullptr, nullptr, bpftime_refresh_cached_tid_in_child);
+#endif
+
+int64_t current_thread_id()
+{
+#if __linux__
+	// If the fork handler could not be registered, a forked child would keep
+	// the parent's tid, so resolve every call directly.
+	if (bpftime_tid_atfork_status != 0)
+		return (int64_t)syscall(SYS_gettid);
+	if (bpftime_cached_tid == -1)
+		bpftime_cached_tid = (int64_t)syscall(SYS_gettid);
+	return bpftime_cached_tid;
+#elif __APPLE__
+	uint64_t tid = 0;
+	pthread_threadid_np(nullptr, &tid);
+	return (int64_t)tid;
+#else
+	return 0;
+#endif
+}
+
+uint64_t next_software_perf_event_generation()
+{
+	static std::atomic<uint64_t> next_generation{ 1 };
+	uint64_t generation =
+		next_generation.fetch_add(1, std::memory_order_relaxed);
+	return ((uint64_t)(uint32_t)getpid() << 32) ^ generation;
+}
+
+bool is_thread_alive(int pid, int64_t tid)
+{
+#if __linux__
+	if (syscall(SYS_tgkill, pid, (pid_t)tid, 0) == 0) {
+		return true;
+	}
+	return errno == EPERM;
+#else
+	(void)pid;
+	(void)tid;
+	return true;
+#endif
+}
+
+struct software_perf_event_shard_cache_entry {
+	uint64_t event_generation;
+	uint64_t buffer_generation;
+	uint64_t shard_generation;
+	software_perf_event_shard *shard;
+	const software_perf_event_data *owner;
+};
+
+// Six entries keep the per-thread initial-exec footprint at 240 bytes. A
+// larger table exhausted the static TLS surplus when this runtime is
+// dlopen()ed after startup: the Nginx attach example failed with
+// "cannot allocate memory in static TLS block". The cache stays
+// allocation-free; exceeding the capacity reuses the bounded eviction path.
+constexpr size_t max_software_perf_event_shard_cache_entries = 6;
+static_assert(
+	sizeof(software_perf_event_shard_cache_entry) *
+			max_software_perf_event_shard_cache_entries <=
+		256,
+	"initial-exec shard cache must fit the late-dlopen static TLS budget");
+constexpr uint64_t software_perf_event_reclaim_drain_interval = 64;
+constexpr size_t software_perf_event_reclaim_shard_threshold = 64;
+
+// Output can be called while libc holds a malloc arena lock. Keep this cache
+// trivial: a TLS container's destructor registration itself calls calloc.
+static_assert(
+	std::is_trivially_destructible_v<
+		software_perf_event_shard_cache_entry>);
+thread_local software_perf_event_shard_cache_entry
+	software_perf_event_shard_cache[
+		max_software_perf_event_shard_cache_entries]
+#if defined(__linux__)
+	__attribute__((tls_model("initial-exec")))
+#endif
+	= {};
+thread_local size_t next_victim_slot
+#if defined(__linux__)
+	__attribute__((tls_model("initial-exec")))
+#endif
+	= 0;
+
+void cache_software_perf_event_shard(
+	software_perf_event_shard_cache_entry value)
+{
+	for (auto &entry : software_perf_event_shard_cache) {
+		if (entry.owner == nullptr || entry.owner == value.owner) {
+			entry = value;
+			return;
+		}
+	}
+	// Every slot holds a different owner. Replace one slot round-robin rather
+	// than clearing the table: with more live events than slots, clearing all
+	// of them evicts every entry on each miss and sends the whole rotation back
+	// to the shard lock.
+	software_perf_event_shard_cache[next_victim_slot++ %
+					 max_software_perf_event_shard_cache_entries] =
+		value;
+}
+} // namespace
+
+#if defined(BPFTIME_UNIT_TESTING)
+size_t cached_software_perf_event_shard_count()
+{
+	size_t cached = 0;
+	for (const auto &entry : software_perf_event_shard_cache)
+		if (entry.owner != nullptr)
+			++cached;
+	return cached;
+}
+#endif
+
 bpf_perf_event_handler::bpf_perf_event_handler(
 	int type, const char *attach_arg,
 	boost::interprocess::managed_shared_memory &mem)
@@ -145,89 +335,6 @@ bpf_perf_event_handler::bpf_perf_event_handler(
 {
 }
 
-bool software_perf_event_data::has_data() const
-{
-	auto &ref = get_header_ref_const();
-	return ref.data_tail != ref.data_head;
-}
-
-const perf_event_mmap_page &
-software_perf_event_data::get_header_ref_const() const
-{
-	return *(perf_event_mmap_page *)(uintptr_t)(mmap_buffer.data());
-}
-
-int software_perf_event_data::output_data(const void *buf, size_t size)
-{
-	SPDLOG_DEBUG("Handling perf event output data with size {}", size);
-	auto &header = get_header_ref();
-	perf_sample_raw head;
-	head.header.type = PERF_RECORD_SAMPLE;
-	head.header.size = sizeof(head) + size;
-	head.header.misc = 0;
-	head.size = size;
-	int64_t data_head = smp_load_acquire_u64(&header.data_head);
-	int64_t data_tail = header.data_tail;
-	uint8_t *base_addr = (uint8_t *)mmap_buffer.data() + pagesize;
-	int64_t available_size = mmap_size() - (data_head - data_tail);
-	SPDLOG_DEBUG("Data tail={}", data_tail);
-	if (available_size == 0) {
-		SPDLOG_DEBUG("Upgraded available size to {}", mmap_size());
-		available_size = mmap_size();
-	}
-	// If available_size is less or equal than head.header.size, just drop
-	// the data. In this way, we'll never make data_head equals to
-	// data_tail, at situation other than an empty buffer
-	if (available_size <= head.header.size) {
-		SPDLOG_DEBUG(
-			"Dropping data with size {}, available_size {}, required size {}",
-			size, available_size, head.header.size);
-		return 0;
-	}
-	auto &copy_size = head.header.size;
-	if (copy_buffer.size() != copy_size)
-		copy_buffer.resize(copy_size);
-
-	memcpy(copy_buffer.data(), &head, sizeof(head));
-	memcpy((uint8_t *)(copy_buffer.data()) + sizeof(head), buf, size);
-	uint8_t *copy_start_1 = base_addr + (data_head & (mmap_size() - 1));
-	if (copy_size + copy_start_1 <= base_addr + mmap_size()) {
-		memcpy(copy_start_1, copy_buffer.data(), copy_size);
-	} else {
-		size_t len_first = base_addr + mmap_size() - copy_start_1;
-		size_t len_second = copy_size - len_first;
-		memcpy(copy_start_1, copy_buffer.data(), len_first);
-		memcpy(base_addr, copy_buffer.data() + len_first, len_second);
-	}
-	uint64_t new_head = (data_head + copy_size);
-	smp_store_release_u64(&header.data_head, new_head);
-	SPDLOG_DEBUG(
-		"Data of size {}, total size {} outputed at head {}; new_head={} addr={:x}; available_size={}",
-		size, copy_size, data_head, new_head,
-		(uintptr_t)(base_addr + data_head), available_size);
-
-	return 0;
-}
-
-perf_event_mmap_page &software_perf_event_data::get_header_ref()
-{
-	return *(perf_event_mmap_page *)(uintptr_t)(mmap_buffer.data());
-}
-
-software_perf_event_data::software_perf_event_data(
-	int cpu, int64_t config, int32_t sample_type,
-	boost::interprocess::managed_shared_memory &memory)
-	: cpu(cpu), config(config), sample_type(sample_type),
-	  pagesize(getpagesize()),
-	  mmap_buffer(pagesize, memory.get_segment_manager()),
-	  copy_buffer(pagesize, memory.get_segment_manager())
-{
-	perf_event_mmap_page &perf_header = get_header_ref();
-	perf_header.data_offset = pagesize;
-	perf_header.data_head = perf_header.data_tail = 0;
-	perf_header.data_size = 0;
-}
-
 [[maybe_unused]] static inline int popcnt(uint64_t x)
 {
 	int ret = 0;
@@ -238,25 +345,381 @@ software_perf_event_data::software_perf_event_data(
 	return ret;
 }
 
-void *software_perf_event_data::ensure_mmap_buffer(size_t buffer_size)
+software_perf_event_buffer::software_perf_event_buffer(int pagesize,
+						       segment_manager *manager)
+	: pagesize(pagesize), mmap_buffer(pagesize, manager),
+	  copy_buffer(manager)
 {
+	perf_event_mmap_page &perf_header = get_header_ref();
+	perf_header.data_offset = pagesize;
+	perf_header.data_head = perf_header.data_tail = 0;
+	perf_header.data_size = 0;
+}
+
+const perf_event_mmap_page &
+software_perf_event_buffer::get_header_ref_const() const
+{
+	return *(perf_event_mmap_page *)(uintptr_t)(mmap_buffer.data());
+}
+
+perf_event_mmap_page &software_perf_event_buffer::get_header_ref()
+{
+	return *(perf_event_mmap_page *)(uintptr_t)(mmap_buffer.data());
+}
+
+bool software_perf_event_buffer::has_data() const
+{
+	auto &ref = get_header_ref_const();
+	return smp_load_acquire_u64(&ref.data_tail) !=
+	       smp_load_acquire_u64(&ref.data_head);
+}
+
+void *software_perf_event_buffer::ensure_mmap_buffer(size_t buffer_size)
+{
+	const size_t page_size = static_cast<size_t>(pagesize);
 	if (buffer_size > mmap_buffer.size()) {
-		SPDLOG_DEBUG("Expanding mmap buffer size to {}", buffer_size);
-		mmap_buffer.resize(buffer_size);
-		// Update data size in the mmap header
-		get_header_ref().data_size = buffer_size - pagesize;
-		if (popcnt(buffer_size - pagesize) != 1) {
+		if (buffer_size < page_size ||
+		    popcnt(buffer_size - page_size) != 1) {
 			SPDLOG_ERROR(
 				"Data size of a perf event buffer must be power of 2");
+			errno = EINVAL;
 			return nullptr;
 		}
+		SPDLOG_DEBUG("Expanding mmap buffer size to {}", buffer_size);
+		auto report_allocation_failure = [&](const std::exception
+							     &error) {
+			SPDLOG_ERROR(
+				"Unable to allocate {}-byte perf buffer: {}",
+				buffer_size, error.what());
+			errno = ENOMEM;
+			return nullptr;
+		};
+		try {
+			mmap_buffer.resize(buffer_size);
+		} catch (const std::exception &e) {
+			return report_allocation_failure(e);
+		}
+		// Update data size in the mmap header
+		get_header_ref().data_size = buffer_size - page_size;
 	}
 	return mmap_buffer.data();
 }
 
-size_t software_perf_event_data::mmap_size() const
+size_t software_perf_event_buffer::mmap_size() const
 {
 	return mmap_buffer.size() - pagesize;
+}
+
+bool software_perf_event_buffer::append_record(const void *record,
+					       size_t record_size)
+{
+	return append_record_parts(record, record_size, nullptr, 0);
+}
+
+bool software_perf_event_buffer::append_record_parts(const void *first,
+						     size_t first_size,
+						     const void *second,
+						     size_t second_size,
+						     size_t padding_size)
+{
+	if (second_size > std::numeric_limits<size_t>::max() - first_size ||
+	    padding_size > std::numeric_limits<size_t>::max() - first_size -
+				   second_size) {
+		return false;
+	}
+	const size_t record_size = first_size + second_size + padding_size;
+	if (mmap_size() == 0 || record_size > mmap_size()) {
+		return false;
+	}
+	auto &header = get_header_ref();
+	uint64_t data_head = smp_load_acquire_u64(&header.data_head);
+	uint64_t data_tail = smp_load_acquire_u64(&header.data_tail);
+	const uint64_t used_size = data_head - data_tail;
+	if (data_head < data_tail || used_size >= mmap_size()) {
+		SPDLOG_DEBUG(
+			"Dropping perf record with invalid ring state: head {}, tail {}, ring size {}",
+			data_head, data_tail, mmap_size());
+		return false;
+	}
+	const size_t available_size = mmap_size() - used_size;
+	// Keep one byte empty so head == tail only represents an empty buffer.
+	if (available_size <= record_size) {
+		SPDLOG_DEBUG(
+			"Dropping perf record with size {}, available_size {}",
+			record_size, available_size);
+		return false;
+	}
+
+	write_wrapped(data_head, first, first_size);
+	if (second_size > 0) {
+		write_wrapped(data_head + first_size, second, second_size);
+	}
+	uint64_t new_head = data_head + record_size;
+	smp_store_release_u64(&header.data_head, new_head);
+	SPDLOG_DEBUG(
+		"Perf record of size {} outputed at head {}; new_head={} addr={:x}; available_size={}",
+		record_size, data_head, new_head,
+		(uintptr_t)((uint8_t *)mmap_buffer.data() + pagesize +
+			    (data_head & (mmap_size() - 1))),
+		available_size);
+	return true;
+}
+
+int software_perf_event_buffer::output_data(const void *buf, size_t size)
+{
+	SPDLOG_DEBUG("Handling perf event output data with size {}", size);
+	constexpr size_t alignment = sizeof(uint64_t);
+	if (size > std::numeric_limits<uint16_t>::max() -
+			   sizeof(perf_sample_raw) - (alignment - 1)) {
+		errno = E2BIG;
+		return -1;
+	}
+	const size_t record_size =
+		(sizeof(perf_sample_raw) + size + alignment - 1) &
+		~(alignment - 1);
+	perf_sample_raw header;
+	header.header.type = PERF_RECORD_SAMPLE;
+	header.header.size = record_size;
+	header.header.misc = 0;
+	header.size = record_size - sizeof(header);
+
+	append_record_parts(&header, sizeof(header), buf, size,
+			    header.size - size);
+	return 0;
+}
+
+void software_perf_event_buffer::write_wrapped(uint64_t offset, const void *src,
+					       size_t size)
+{
+	uint8_t *base_addr = (uint8_t *)mmap_buffer.data() + pagesize;
+	uint8_t *copy_start = base_addr + (offset & (mmap_size() - 1));
+	if (size + copy_start <= base_addr + mmap_size()) {
+		memcpy(copy_start, src, size);
+	} else {
+		size_t len_first = base_addr + mmap_size() - copy_start;
+		size_t len_second = size - len_first;
+		memcpy(copy_start, src, len_first);
+		memcpy(base_addr, (const uint8_t *)src + len_first, len_second);
+	}
+}
+
+void software_perf_event_buffer::read_wrapped(uint64_t offset, void *dst,
+					      size_t size) const
+{
+	const uint8_t *base_addr =
+		(const uint8_t *)mmap_buffer.data() + pagesize;
+	const uint8_t *copy_start = base_addr + (offset & (mmap_size() - 1));
+	if (size + copy_start <= base_addr + mmap_size()) {
+		memcpy(dst, copy_start, size);
+	} else {
+		size_t len_first = base_addr + mmap_size() - copy_start;
+		size_t len_second = size - len_first;
+		memcpy(dst, copy_start, len_first);
+		memcpy((uint8_t *)dst + len_first, base_addr, len_second);
+	}
+}
+
+bool software_perf_event_buffer::copy_next_record_to(
+	software_perf_event_buffer &dst)
+{
+	if (mmap_size() == 0) {
+		return false;
+	}
+	auto &header = get_header_ref();
+	uint64_t data_tail = smp_load_acquire_u64(&header.data_tail);
+	uint64_t data_head = smp_load_acquire_u64(&header.data_head);
+	if (data_tail == data_head) {
+		return false;
+	}
+	if (data_head < data_tail) {
+		SPDLOG_ERROR("Invalid perf buffer state: head {} < tail {}",
+			     data_head, data_tail);
+		smp_store_release_u64(&header.data_tail, data_head);
+		return false;
+	}
+
+	perf_event_header record_header;
+	read_wrapped(data_tail, &record_header, sizeof(record_header));
+	if (record_header.size < sizeof(record_header) ||
+	    record_header.size > mmap_size()) {
+		SPDLOG_ERROR("Invalid perf record size {}, dropping shard data",
+			     record_header.size);
+		smp_store_release_u64(&header.data_tail, data_head);
+		return false;
+	}
+	if (record_header.size > data_head - data_tail) {
+		return false;
+	}
+
+	if (copy_buffer.size() != record_header.size)
+		copy_buffer.resize(record_header.size);
+	read_wrapped(data_tail, copy_buffer.data(), record_header.size);
+	if (!dst.append_record(copy_buffer.data(), record_header.size)) {
+		return false;
+	}
+	smp_store_release_u64(&header.data_tail,
+			      data_tail + record_header.size);
+	return true;
+}
+
+software_perf_event_shard::software_perf_event_shard(
+	int pid, int64_t tid, uint64_t generation, uint64_t buffer_generation,
+	int pagesize, software_perf_event_buffer::segment_manager *manager,
+	size_t buffer_size)
+	: pid(pid), tid(tid), generation(generation),
+	  buffer_generation(buffer_generation), buffer(pagesize, manager)
+{
+	buffer.ensure_mmap_buffer(buffer_size);
+}
+
+software_perf_event_data::software_perf_event_data(
+	int cpu, int64_t config, int32_t sample_type,
+	boost::interprocess::managed_shared_memory &memory)
+	: cpu(cpu), config(config), sample_type(sample_type),
+	  pagesize(getpagesize()),
+	  event_generation(next_software_perf_event_generation()),
+	  consumer_buffer(pagesize, memory.get_segment_manager()),
+	  producer_shards(memory.get_segment_manager())
+{
+	pthread_spin_init(&shard_lock, PTHREAD_PROCESS_SHARED);
+}
+
+software_perf_event_data::~software_perf_event_data()
+{
+	pthread_spin_destroy(&shard_lock);
+}
+
+software_perf_event_shard &software_perf_event_data::get_current_thread_shard()
+{
+	const int pid = getpid();
+	const int64_t tid = current_thread_id();
+	uint64_t current_buffer_generation =
+		READ_ONCE_U64(producer_buffer_generation);
+	for (auto &entry : software_perf_event_shard_cache) {
+		if (entry.owner != this)
+			continue;
+		if (entry.event_generation != event_generation ||
+		    entry.buffer_generation != current_buffer_generation) {
+			entry.owner = nullptr;
+		} else if (entry.shard->pid == pid && entry.shard->tid == tid &&
+			   entry.shard->generation == entry.shard_generation &&
+			   entry.shard->buffer_generation ==
+				   current_buffer_generation) {
+			return *entry.shard;
+		} else {
+			entry.owner = nullptr;
+		}
+		break;
+	}
+
+	spin_lock_guard guard(shard_lock);
+	current_buffer_generation = READ_ONCE_U64(producer_buffer_generation);
+	if (producer_shards.size() >=
+	    software_perf_event_reclaim_shard_threshold) {
+		reclaim_inactive_producer_shards_locked();
+	}
+	for (auto &shard : producer_shards) {
+		if (shard.pid == pid && shard.tid == tid &&
+		    shard.buffer_generation == current_buffer_generation) {
+			cache_software_perf_event_shard({
+				event_generation, current_buffer_generation,
+				shard.generation, &shard, this
+			});
+			return shard;
+		}
+	}
+
+	auto *manager = producer_shards.get_allocator().get_segment_manager();
+	producer_shards.emplace_back(pid, tid, next_shard_generation++,
+				     current_buffer_generation, pagesize,
+				     manager,
+				     consumer_buffer.mmap_buffer.size());
+	auto &shard = producer_shards.back();
+	cache_software_perf_event_shard({ event_generation,
+						  current_buffer_generation,
+						  shard.generation, &shard, this });
+	return shard;
+}
+
+void software_perf_event_data::drain_producer_shards()
+{
+	spin_lock_guard guard(shard_lock);
+	for (auto &shard : producer_shards) {
+		while (shard.buffer.copy_next_record_to(consumer_buffer)) {
+		}
+	}
+	maybe_reclaim_inactive_producer_shards_locked();
+}
+
+void software_perf_event_data::maybe_reclaim_inactive_producer_shards_locked()
+{
+	if (producer_shards.empty()) {
+		drains_since_reclaim = 0;
+		return;
+	}
+	if (++drains_since_reclaim >=
+		    software_perf_event_reclaim_drain_interval ||
+	    producer_shards.size() >=
+		    software_perf_event_reclaim_shard_threshold) {
+		drains_since_reclaim = 0;
+		reclaim_inactive_producer_shards_locked();
+	}
+}
+
+void software_perf_event_data::reclaim_inactive_producer_shards_locked()
+{
+	for (auto itr = producer_shards.begin();
+	     itr != producer_shards.end();) {
+		auto &shard = *itr;
+		if (!shard.buffer.has_data() &&
+		    !is_thread_alive(shard.pid, shard.tid)) {
+			itr = producer_shards.erase(itr);
+		} else {
+			++itr;
+		}
+	}
+}
+
+bool software_perf_event_data::has_data()
+{
+	drain_producer_shards();
+	return consumer_buffer.has_data();
+}
+
+const perf_event_mmap_page &
+software_perf_event_data::get_header_ref_const() const
+{
+	return consumer_buffer.get_header_ref_const();
+}
+
+int software_perf_event_data::output_data(const void *buf, size_t size)
+{
+	return get_current_thread_shard().buffer.output_data(buf, size);
+}
+
+perf_event_mmap_page &software_perf_event_data::get_header_ref()
+{
+	return consumer_buffer.get_header_ref();
+}
+
+void *software_perf_event_data::ensure_mmap_buffer(size_t buffer_size)
+{
+	spin_lock_guard guard(shard_lock);
+	const size_t old_buffer_size = consumer_buffer.mmap_buffer.size();
+	void *result = consumer_buffer.ensure_mmap_buffer(buffer_size);
+	if (result == nullptr) {
+		return nullptr;
+	}
+	if (consumer_buffer.mmap_buffer.size() != old_buffer_size) {
+		WRITE_ONCE_U64(producer_buffer_generation,
+			       producer_buffer_generation + 1);
+	}
+	return result;
+}
+
+size_t software_perf_event_data::mmap_size() const
+{
+	return consumer_buffer.mmap_size();
 }
 
 std::optional<software_perf_event_weak_ptr>

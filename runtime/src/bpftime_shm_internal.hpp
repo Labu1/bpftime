@@ -9,12 +9,14 @@
 #include "bpf_map/userspace/ringbuf_map.hpp"
 #include "bpf_map/userspace/stack_trace_map.hpp"
 #include <boost/interprocess/managed_shared_memory.hpp>
+#include <boost/interprocess/sync/interprocess_mutex.hpp>
 #include <cstddef>
 #include <functional>
 #include <boost/interprocess/containers/set.hpp>
 #include "bpftime_shm.hpp"
 #include <handler/handler_manager.hpp>
 #include <optional>
+#include <cstdint>
 
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 namespace bpftime
@@ -29,6 +31,35 @@ struct CommSharedMem;
 namespace bpftime
 {
 
+class shm_lifecycle_lock {
+    public:
+	explicit shm_lifecycle_lock(const char *shm_name) noexcept;
+	~shm_lifecycle_lock();
+
+	shm_lifecycle_lock(const shm_lifecycle_lock &) = delete;
+	shm_lifecycle_lock &operator=(const shm_lifecycle_lock &) = delete;
+
+    private:
+	int lock_fd = -1;
+};
+
+static constexpr std::uint64_t BPFTIME_EPOCH_SEQ_UNSTABLE = UINT64_MAX;
+static constexpr std::uint64_t BPFTIME_EPOCH_SEQ_MISSING = UINT64_MAX - 1;
+
+// Shared-memory global tracing session version.
+// Use epoch_seq as a simple seqlock:
+// - odd  : server is updating/resetting handlers
+// - even : stable; session_id = epoch_seq / 2
+struct bpftime_global_epoch_state {
+	std::uint64_t epoch_seq = 0;
+};
+
+static constexpr int BPFTIME_MAX_CPU_COUNT = 1024;
+
+struct bpftime_cpu_exec_locks {
+	boost::interprocess::interprocess_mutex locks[BPFTIME_MAX_CPU_COUNT];
+};
+
 using syscall_pid_set_allocator = boost::interprocess::allocator<
 	int, boost::interprocess::managed_shared_memory::segment_manager>;
 using syscall_pid_set =
@@ -40,6 +71,14 @@ using alive_agent_pid_set_allocator = boost::interprocess::allocator<
 using alive_agent_pids =
 	boost::interprocess::set<int, std::less<int>,
 				 alive_agent_pid_set_allocator>;
+
+using alive_syscall_server_pid_set_allocator =
+	boost::interprocess::allocator<
+		int, boost::interprocess::managed_shared_memory::segment_manager>;
+
+using alive_syscall_server_pid_set =
+	boost::interprocess::set<int, std::less<int>,
+				 alive_syscall_server_pid_set_allocator>;
 
 // global bpftime share memory
 class bpftime_shm {
@@ -56,15 +95,25 @@ class bpftime_shm {
 	syscall_pid_set *syscall_installed_pids = nullptr;
 
 	// Configuration for the agent. e.g, which helpers are enabled
-	struct bpftime::agent_config *agent_config = nullptr;
+	struct bpftime::runtime_config *runtime_config = nullptr;
 
 	// Record which pids are injected by agent
 	alive_agent_pids *injected_pids;
 
+	// Record which pids own or use the syscall-server side of this shm.
+	alive_syscall_server_pid_set *alive_syscall_server_pids = nullptr;
+
+	// Guards pid bookkeeping sets stored in shared memory.
+	boost::interprocess::interprocess_mutex *pid_set_lock = nullptr;
+
+	bpftime_global_epoch_state *epoch_state = nullptr;
+	bpftime_cpu_exec_locks *cpu_exec_locks = nullptr;
+
 	// local agent config can be used for test or local process
-	std::optional<struct agent_config> local_agent_config;
+	std::optional<struct runtime_config> local_runtime_config;
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 	cuda::CommSharedMem *cuda_comm_shared_mem = nullptr;
+	bool cuda_host_memory_registered = false;
 #endif
 
 
@@ -75,9 +124,23 @@ class bpftime_shm {
 #endif
 
     public:
-	shm_open_type get_shm_open_type() const
+	// True when the fully-contained [addr, addr+size) range lies inside the
+	// mapped SHM segment. Backends with runtime memory safety checks
+	// (uBPF) use this to admit BPF map/context accesses that the kernel
+	// verifier would normally allow. Includes an overflow guard.
+	bool is_within_shm_segment(uint64_t addr, uint64_t size) const
 	{
-		return open_type;
+		if (size == 0) {
+			return true;
+		}
+		const auto base = reinterpret_cast<uint64_t>(
+			segment.get_address());
+		const uint64_t seg_size = segment.get_size();
+		if (addr < base || size > seg_size) {
+			return false;
+		}
+		const uint64_t offset = addr - base;
+		return offset <= seg_size - size;
 	}
 	void set_enable_mock(bool flag)
 	{
@@ -90,9 +153,9 @@ class bpftime_shm {
 		mock_setter = fn;
 	}
 	// Get the configuration object
-	const struct agent_config &get_agent_config();
+	const struct runtime_config &get_runtime_config();
 	// Set the configuration object
-	void set_agent_config(struct agent_config &&config);
+	void set_runtime_config(struct runtime_config &&config);
 	// Check whether a certain pid was already equipped with syscall tracer
 	// Using a set stored in the shared memory
 	bool check_syscall_trace_setup(int pid);
@@ -100,17 +163,56 @@ class bpftime_shm {
 	// Using a set stored in the shared memory
 	void set_syscall_trace_setup(int pid, bool whether);
 
-	// Add a pid into alive agent set
-	void add_pid_into_alive_agent_set(int pid);
-	// Remove a pid from alive agent set
-	void remove_pid_from_alive_agent_set(int pid);
-	// Iterate over all pids from the alive agent set
-	void iterate_all_pids_in_alive_agent_set(std::function<void(int)> &&cb);
+		// Add a pid into alive agent set
+		bool add_pid_into_alive_agent_set(int pid);
+		// Remove a pid from alive agent set
+		bool remove_pid_from_alive_agent_set(int pid);
+		// Iterate over all pids from the alive agent set. Returns false when
+		// the snapshot could not be read safely.
+		bool iterate_all_pids_in_alive_agent_set(
+			std::function<void(int)> &&cb);
+		// Add a pid into alive syscall-server set
+		bool add_pid_into_alive_syscall_server_set(int pid);
+		// Remove a pid from alive syscall-server set
+		bool remove_pid_from_alive_syscall_server_set(int pid);
+		// Iterate over all pids from the alive syscall-server set. Returns
+		// false when the snapshot could not be read safely.
+		bool iterate_all_pids_in_alive_syscall_server_set(
+			std::function<void(int)> &&cb);
+
+	// Server-side: clear all existing handlers (maps/progs/links/events) and
+	// reset per-session bookkeeping stored in shm. This is used to allow
+	// repeated "bpftime trace" sessions without recreating the shm object, so
+	// already-injected agents keep the same mapping.
+	void reset_server_state();
+	// Server-side: start a new session (epoch++) and clear handlers. Returns
+	// the new stable epoch_seq (even).
+	std::uint64_t begin_new_session();
+	// Agent/observer: best-effort read a stable epoch_seq (even).
+	// Returns 0 if the epoch object isn't available.
+	// Returns UINT64_MAX if the epoch couldn't be stabilized within max_tries.
+	std::uint64_t read_stable_epoch_seq(int max_tries = 200) const;
+	void lock_bpf_cpu(int cpu);
+	void unlock_bpf_cpu(int cpu);
+	// Blocking, exception-safe per-CPU lock used on the BPF hot path. It
+	// preserves the serialization semantics of lock() (waits through normal
+	// contention) but catches locking exceptions, returning false instead of
+	// letting one propagate through the Frida C trampoline into
+	// std::terminate. The caller skips BPF execution only on a locking
+	// error, never on ordinary contention.
+	bool acquire_bpf_cpu(int cpu);
 
 	const handler_variant &get_handler(int fd) const;
 	bool is_epoll_fd(int fd) const;
 
 	bool is_map_fd(int fd) const;
+
+private:
+	// Returns the map handler for `fd`, or nullptr (with errno=ENOENT) if
+	// `fd` is not a map fd. Shared by the bpf_map_* accessors below.
+	const bpf_map_handler *try_get_map_handler(int fd) const;
+
+public:
 	bool is_ringbuf_map_fd(int fd) const;
 	bool is_array_map_fd(int fd) const;
 
@@ -168,6 +270,9 @@ class bpftime_shm {
 
 	long bpf_map_pop_elem(int fd, void *value, bool from_syscall) const;
 
+	long bpf_map_lookup_and_delete_elem(int fd, const void *key, void *value,
+					    bool from_syscall) const;
+
 	long bpf_map_peek_elem(int fd, void *value, bool from_syscall) const;
 
 	int bpf_map_get_next_key(int fd, const void *key, void *next_key,
@@ -211,12 +316,15 @@ class bpftime_shm {
 					     epoll_data_t extra_data);
 
 	int epoll_create();
+	int epoll_create_at(int fd);
 	// remove a fake fd from the manager.
 	// The fake fd should be closed by the caller.
 	void close_fd(int fd);
 	bool is_exist_fake_fd(int fd) const;
 
 	int add_memfd_handler(const char *name, int flags);
+
+	int translate_shared_map_type_to_kernel_map_type(int type);
 
 #if BPFTIME_ENABLE_MPK
 	void enable_mpk();

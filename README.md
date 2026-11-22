@@ -17,12 +17,10 @@
 
 bpftime is not `userspace eBPF VM`, it's a userspace runtime framework includes everything to run eBPF in userspace: `loader`, `verifier`, `helpers`, `maps`, `ufunc` and multiple `events` such as Observability, Network, Policy or Access Control. It has multiple VM backend options support. For eBPF VM only, please see [llvmbpf](https://github.com/eunomia-bpf/llvmbpf).
 
-> ⚠️ **Note**: `bpftime` is currently under active development and refactoring towards v2. It may contain bugs or unstable API. Please use it with caution. For more details, check our [roadmap](#roadmap). We'd love to hear your feedback and suggestions! Feel free to open an issue or [Contact us](#contact-and-citations).
-
 ## Why bpftime? What's the design Goal?
 
 - **Performance Gains**: Achieve better performance by `bypassing the kernel` (e.g., via `Userspace DBI` or `Network Drivers`), with more configurable, optimized and more arch supported JIT/AOT options like `LLVM`, while maintaining compatibility with Linux kernel eBPF.
-- **Cross-Platform Compatibility**: Enables `eBPF functionality and large ecosystem` where kernel eBPF is unavailable, such as on older or alternative operating systems, or where kernel-level permissions are restricted, without changing your tool.
+- **Cross-Platform Compatibility**: Enables `eBPF functionality and large ecosystem` where kernel eBPF is unavailable, such as on older kernel, `MacOS`, or in rootless containers, without changing your tool.
 - **Flexible and General Extension Language & Runtime for Innovation**: eBPF is designed for innovation, evolving into a General Extension Language & Runtime in production that supports very diverse use cases. `bpftime`'s modular design allows easy integration as a library for adding new events and program types without touching kernel. Wishing it could enable rapid prototyping and exploration of new features!
 
 ## Key Features
@@ -33,7 +31,7 @@ bpftime is not `userspace eBPF VM`, it's a userspace runtime framework includes 
 - **Compatibility**: use `existing eBPF toolchains` like clang, libbpf and bpftrace to develop userspace eBPF application without any modifications. Supporting CO-RE via BTF, and offering userspace `ufunc` access.
 - **Multi JIT Support**: Support [llvmbpf](https://github.com/eunomia-bpf/llvmbpf), a high-speed `JIT/AOT` compiler powered by LLVM, or using `ubpf JIT` and INTERPRETER. The vm can be built as `a standalone library` like ubpf.
 - **Run with kernel eBPF**: Can load userspace eBPF from kernel, and using kernel eBPF maps to cooperate with kernel eBPF programs like kprobes and network filters.
-- **Integrate with AF_XDP or DPDK**: Run your `XDP` network applications with better performance in userspace just like in kernel!(experimental)
+- **Integrate with AF_XDP, DPDK or GPU**: Run your `XDP` network applications or GPU trace tools with better performance in userspace just like in kernel!
 
 ## Components
 
@@ -61,7 +59,6 @@ In another shell, Run the target program with eBPF inside:
 
 ```console
 $ bpftime start ./example/malloc/victim
-Hello malloc!
 malloc called from pid 250215
 continue malloc...
 malloc called from pid 250215
@@ -184,7 +181,16 @@ Our OSDI '25 paper: <https://www.usenix.org/conference/osdi25/presentation/zheng
 
 ## Acknowledgement
 
-eunomia-bpf community is sponsored by [PLCT Lab](https://plctlab.github.io/) from [ISCAS](http://english.is.cas.cn/au/).
-
-Thanks for other sponsors and discussions help building this project: [Prof. Marios Kogias](https://marioskogias.github.io/) from Imperial College London, [Prof. Xiaozheng lai](https://www2.scut.edu.cn/cs/2017/0129/c22285a327654/page.htm) from SCUT, [Prof lijun chen](http://www.xiyou.edu.cn/info/2394/67845.htm) from XUPT,
+Thanks for sponsors and discussions help building this project: [PLCT Lab](https://plctlab.github.io/) from [ISCAS](http://english.is.cas.cn/au/), [Prof. Marios Kogias](https://marioskogias.github.io/) from Imperial College London, [Prof. Xiaozheng lai](https://www2.scut.edu.cn/cs/2017/0129/c22285a327654/page.htm) from SCUT, [Prof lijun chen](http://www.xiyou.edu.cn/info/2394/67845.htm) from XUPT,
 [Prof. Qi Li](https://sites.google.com/site/qili2012/) from THU [NISL Lab](https://netsec.ccert.edu.cn/en/), and Linux eBPF maintainers in the LPC 23 eBPF track.
+
+<p align="center">
+  <a href="https://www.vultr.com/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="images/vultr-white.png">
+      <img src="images/vultr-black.svg" alt="Vultr" width="200">
+    </picture>
+  </a>
+  <br>
+  Cloud Infrastructure powered by <a href="https://www.vultr.com/">Vultr</a>
+</p>

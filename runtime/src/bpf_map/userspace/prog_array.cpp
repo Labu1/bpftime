@@ -5,15 +5,13 @@
  */
 
 #if __linux__
-#include "bpf/bpf.h"
 #include "linux/bpf.h"
-#include <bpf/libbpf.h>
 #include <gnu/lib-names.h>
 #include <asm/unistd.h>
 #elif __APPLE__
 #include "bpftime_epoll.h"
 #endif
-#include "spdlog/spdlog.h"
+#include "bpftime_shm.hpp"
 #include <bpf_map/userspace/prog_array.hpp>
 #include <cerrno>
 #include <spdlog/spdlog.h>
@@ -24,7 +22,6 @@
 #define offsetofend(TYPE, FIELD)                                               \
 	(offsetof(TYPE, FIELD) + sizeof(((TYPE *)0)->FIELD))
 #endif
-
 
 #if __linux__
 
@@ -59,7 +56,9 @@ my_bpf_syscall_fd(long cmd, union bpf_attr *attr, unsigned long size)
 	long fd;
 	do {
 		fd = libc_syscall(__NR_bpf, cmd, attr, size);
-	} while (fd < 0 && fd == -EAGAIN && --attempts > 0);
+		// libc syscall() returns -1 and sets errno on failure; it never
+		// returns -EAGAIN directly, so the retry must inspect errno.
+	} while (fd < 0 && errno == EAGAIN && --attempts > 0);
 	return fd;
 }
 
@@ -80,13 +79,34 @@ int my_bpf_prog_get_fd_by_id(__u32 id)
 
 namespace bpftime
 {
-static thread_local uint32_t current_thread_lookup_val = 0;
+namespace
+{
+constexpr int32_t INVALID_ENTRY = -1;
+
+constexpr bool is_userspace_prog_fd_entry(int32_t value)
+{
+	return value < INVALID_ENTRY;
+}
+
+constexpr int32_t encode_userspace_prog_fd(int fd)
+{
+	return -fd - 2;
+}
+
+constexpr int decode_userspace_prog_fd(int32_t value)
+{
+	return -value - 2;
+}
+} // namespace
+
+// The runtime is compiled with -ftls-model=initial-exec, so this access never
+// reaches __tls_get_addr while libc holds an allocator lock.
+static thread_local int32_t current_thread_lookup_val = 0;
 
 prog_array_map_impl::prog_array_map_impl(
 	boost::interprocess::managed_shared_memory &memory, uint32_t key_size,
 	uint32_t value_size, uint32_t max_entries)
-	// Default value of fd map is -1
-	: data(max_entries, -1, memory.get_segment_manager())
+	: data(max_entries, INVALID_ENTRY, memory.get_segment_manager())
 {
 	if (key_size != 4 || value_size != 4) {
 		throw std::runtime_error(
@@ -103,11 +123,27 @@ void *prog_array_map_impl::elem_lookup(const void *key)
 		errno = EINVAL;
 		return nullptr;
 	}
-	int fd = my_bpf_prog_get_fd_by_id(data[k]);
-	if (fd < 0) {
-		SPDLOG_ERROR("Unable to retrive prog fd of id {}", data[k]);
+	int32_t value = data[k];
+	if (value == INVALID_ENTRY) {
+		errno = ENOENT;
+		return nullptr;
 	}
-	SPDLOG_DEBUG("prog array: fd of prog id {} is {}", data[k], fd);
+	if (is_userspace_prog_fd_entry(value)) {
+		int fd = decode_userspace_prog_fd(value);
+		if (!bpftime_is_prog_fd(fd)) {
+			errno = ENOENT;
+			return nullptr;
+		}
+		current_thread_lookup_val = fd;
+		return &current_thread_lookup_val;
+	}
+	int fd = my_bpf_prog_get_fd_by_id(value);
+	if (fd < 0) {
+		SPDLOG_ERROR("Unable to retrieve prog fd of id {}", value);
+		errno = ENOENT;
+		return nullptr;
+	}
+	SPDLOG_DEBUG("prog array: fd of prog id {} is {}", value, fd);
 	current_thread_lookup_val = fd;
 	return &current_thread_lookup_val;
 }
@@ -121,6 +157,12 @@ long prog_array_map_impl::elem_update(const void *key, const void *value,
 		return -1;
 	}
 	int32_t v = *(int32_t *)value;
+	if (bpftime_is_prog_fd(v)) {
+		data[k] = encode_userspace_prog_fd(v);
+		SPDLOG_DEBUG("prog array: update slot {} to bpftime prog fd {}",
+			     k, v);
+		return 0;
+	}
 	struct bpf_prog_info info = {};
 	uint32_t len = sizeof(info);
 	int err = my_bpf_obj_get_info_by_fd(v, &info, &len);
@@ -145,28 +187,28 @@ long prog_array_map_impl::elem_delete(const void *key)
 		errno = EINVAL;
 		return -1;
 	}
-	data[k] = -1;
+	data[k] = INVALID_ENTRY;
 	return 0;
 }
 
 int prog_array_map_impl::map_get_next_key(const void *key, void *next_key)
 {
-	int32_t *out = (int32_t *)next_key;
-	if (key == nullptr) {
+	// Kernel array_map_get_next_key semantics: an absent or out-of-range
+	// key restarts at index 0 instead of failing, and the last index is
+	// the only one that reports -ENOENT. Array iteration is dense, so
+	// empty slots are still visited.
+	uint32_t index = key != nullptr ? *(const uint32_t *)key : UINT32_MAX;
+	uint32_t *out = (uint32_t *)next_key;
+
+	if (index >= data.size()) {
 		*out = 0;
 		return 0;
 	}
-	int32_t k = *(int32_t *)key;
-	// The last key
-	if ((size_t)(k + 1) == data.size()) {
+	if (index == data.size() - 1) {
 		errno = ENOENT;
 		return -1;
 	}
-	if (k < 0 || (size_t)k >= data.size()) {
-		errno = EINVAL;
-		return -1;
-	}
-	*out = k + 1;
+	*out = index + 1;
 	return 0;
 }
 

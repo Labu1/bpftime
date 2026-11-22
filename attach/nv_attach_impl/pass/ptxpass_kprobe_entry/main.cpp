@@ -45,14 +45,12 @@ static ptxpass::pass_config::PassConfig get_default_config()
 static std::pair<std::string, bool>
 patch_entry(const std::string &ptx, const std::string &kernel,
 	    const std::vector<uint64_t> &ebpf_words,
-	    const std::string &stub_name)
+	    const std::string &stub_name, bool add_register_guard)
 {
 	if (ebpf_words.empty()) {
 		return { ptx, false };
 	}
 	std::string fname = std::string("__probe_func__") + kernel;
-	auto func_ptx = ptxpass::compile_ebpf_to_ptx_from_words(
-		ebpf_words, "sm_61", fname, true, false);
 	std::string out = ptx;
 
 	bool patched_stub_calls = false;
@@ -74,6 +72,8 @@ patch_entry(const std::string &ptx, const std::string &kernel,
 	}
 
 	if (patched_stub_calls) {
+		auto func_ptx = ptxpass::compile_ebpf_to_ptx_from_words(
+			ebpf_words, "sm_61", fname, add_register_guard, false);
 		out = func_ptx + "\n" + out;
 		ptxpass::log_transform_stats("kprobe_entry_stub", 1,
 					     ptx.size(), out.size());
@@ -86,6 +86,8 @@ patch_entry(const std::string &ptx, const std::string &kernel,
 	size_t brace = out.find('{', body.first);
 	if (brace == std::string::npos)
 		return { ptx, false };
+	auto func_ptx = ptxpass::compile_ebpf_to_ptx_from_words(
+		ebpf_words, "sm_61", fname, add_register_guard, false);
 	size_t insertPos = brace + 1;
 	if (insertPos < out.size() && out[insertPos] == '\n')
 		insertPos++;
@@ -116,6 +118,7 @@ extern "C" int process_input(const char *input, int length, char *output)
 		std::string stub_name = params.stub_name.empty()
 			? "__bpftime_cuda__kernel_trace"
 			: params.stub_name;
+		bool add_register_guard = params.save_strategy == "full";
 
 		auto runtime_request = pass_runtime_request_from_string(input);
 		if (!validate_input(runtime_request.input.full_ptx,
@@ -126,7 +129,7 @@ extern "C" int process_input(const char *input, int length, char *output)
 			runtime_request.input.full_ptx,
 			runtime_request.input.to_patch_kernel,
 			runtime_request.get_uint64_ebpf_instructions(),
-			stub_name);
+			stub_name, add_register_guard);
 		snprintf(
 			output, length, "%s",
 			emit_runtime_response_and_return(out, modified).c_str());

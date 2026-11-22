@@ -30,6 +30,11 @@ bpftime_ubpf_vm::bpftime_ubpf_vm()
 	}
 }
 
+bpftime_ubpf_vm::~bpftime_ubpf_vm()
+{
+	ubpf_destroy(ubpf_vm);
+}
+
 std::string bpftime_ubpf_vm::get_error_message()
 {
 	return error_string;
@@ -54,8 +59,18 @@ int bpftime_ubpf_vm::register_external_function(size_t index,
 	// Allocate one more id
 	size_t next_id = next_helper_id++;
 	helper_id_map[index] = next_id;
-	return ubpf_register(ubpf_vm, next_id, name.c_str(),
-			     (external_function_t)fn);
+	int err = ubpf_register(ubpf_vm, next_id, name.c_str(),
+				(external_function_t)fn);
+	if (!err && name == "bpf_tail_call")
+		err = ubpf_set_unwind_function_index(ubpf_vm, next_id);
+	return err;
+}
+
+int bpftime_ubpf_vm::register_data_bounds_check(
+	bool (*fn)(void *context, uint64_t addr, uint64_t size), void *context)
+{
+	return ubpf_register_data_bounds_check(ubpf_vm, context,
+					       reinterpret_cast<ubpf_bounds_check>(fn));
 }
 
 int bpftime_ubpf_vm::load_code(const void *code, size_t code_len)

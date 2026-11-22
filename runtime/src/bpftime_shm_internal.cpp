@@ -14,15 +14,28 @@
 #include "spdlog/spdlog.h"
 #include <bpftime_shm_internal.hpp>
 #include <cerrno>
+#include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <string>
+#include <thread>
+#include <vector>
 #if __linux__
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <sys/epoll.h>
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <cuda.h>
 #include <bpf_attach_ctx.hpp>
+namespace bpftime
+{
+void stop_cuda_watcher_before_shm_unmap();
+} // namespace bpftime
 #endif
 #elif __APPLE__
 #include "bpftime_epoll.h"
@@ -47,8 +60,15 @@ extern "C" void bpftime_destroy_global_shm()
 {
 	using namespace bpftime;
 	if (global_shm_initialized) {
+#ifdef BPFTIME_ENABLE_CUDA_ATTACH
+		stop_cuda_watcher_before_shm_unmap();
+#endif
 		// SPDLOG_INFO("Global shm destructed");
 		shm_holder.global_shared_memory.~bpftime_shm();
+		// Make this idempotent: clear the flag so a later explicit call
+		// or the __destruct_shm static destructor does not destroy the
+		// already-destroyed object a second time.
+		global_shm_initialized = false;
 		// Why not spdlog? because global variables that spdlog used
 		// were already destroyed..
 #ifdef DEBUG
@@ -56,6 +76,11 @@ extern "C" void bpftime_destroy_global_shm()
 			(int)getpid());
 #endif
 	}
+}
+
+extern "C" bool bpftime_global_shm_is_initialized()
+{
+	return global_shm_initialized;
 }
 
 extern "C" void bpftime_remove_global_shm()
@@ -69,6 +94,14 @@ extern "C" void bpftime_remove_global_shm()
 
 static __attribute__((destructor(65535))) void __destruct_shm()
 {
+	// If the global shm was never successfully initialized (e.g. a process
+	// that links the runtime but never created/opened shm, or whose
+	// bpftime_shm constructor threw on the expected "shm not ready yet"
+	// path), the object is uninitialized — touching it (get_open_type /
+	// remove_pid_from_alive_agent_set) would read garbage and can crash on
+	// exit. Bail out before any access.
+	if (!global_shm_initialized)
+		return;
 	// This usually indicates that the living shared memory object is used
 	// by an agent instance
 	if (bpftime::shm_holder.global_shared_memory.get_open_type() ==
@@ -88,10 +121,134 @@ namespace bpftime
 
 bpftime_shm_holder shm_holder;
 
+namespace
+{
+class pid_set_scoped_lock {
+public:
+	explicit pid_set_scoped_lock(
+		boost::interprocess::interprocess_mutex *mutex)
+		: mutex(mutex)
+	{
+		if (mutex == nullptr) {
+			locked = true;
+			return;
+		}
+
+		const auto deadline = std::chrono::steady_clock::now() +
+				      std::chrono::milliseconds(250);
+		do {
+			try {
+				if (mutex->try_lock()) {
+					locked = true;
+					return;
+				}
+			} catch (const std::exception &ex) {
+				SPDLOG_WARN(
+					"Unable to lock bpftime pid set: {}",
+					ex.what());
+				return;
+			} catch (...) {
+				SPDLOG_WARN(
+					"Unable to lock bpftime pid set");
+				return;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		} while (std::chrono::steady_clock::now() < deadline);
+
+		SPDLOG_WARN("Timed out locking bpftime pid set");
+	}
+
+	pid_set_scoped_lock(const pid_set_scoped_lock &) = delete;
+	pid_set_scoped_lock &
+	operator=(const pid_set_scoped_lock &) = delete;
+
+	~pid_set_scoped_lock()
+	{
+		if (locked && mutex != nullptr) {
+			try {
+				mutex->unlock();
+			} catch (const std::exception &ex) {
+				SPDLOG_WARN(
+					"Unable to unlock bpftime pid set: {}",
+					ex.what());
+			} catch (...) {
+				SPDLOG_WARN("Unable to unlock bpftime pid set");
+			}
+		}
+	}
+
+	bool owns_lock() const noexcept { return locked; }
+
+private:
+	boost::interprocess::interprocess_mutex *mutex = nullptr;
+	bool locked = false;
+};
+} // namespace
+
+shm_lifecycle_lock::shm_lifecycle_lock(const char *shm_name) noexcept
+{
+#if __linux__
+	try {
+		std::string sanitized;
+		for (const unsigned char ch :
+		     std::string(shm_name == nullptr ? "" : shm_name)) {
+			if (std::isalnum(ch) || ch == '_' || ch == '-' ||
+			    ch == '.') {
+				sanitized.push_back(static_cast<char>(ch));
+			} else {
+				sanitized.push_back('_');
+			}
+		}
+		if (sanitized.empty()) {
+			sanitized = "default";
+		}
+		std::string lock_path =
+			"/tmp/bpftime-shm-" + sanitized + ".lock";
+		lock_fd = open(lock_path.c_str(), O_CREAT | O_RDWR | O_CLOEXEC,
+			       0666);
+		if (lock_fd < 0) {
+			return;
+		}
+		(void)fchmod(lock_fd, 0666);
+		while (flock(lock_fd, LOCK_EX) != 0) {
+			if (errno != EINTR) {
+				close(lock_fd);
+				lock_fd = -1;
+				return;
+			}
+		}
+	} catch (...) {
+		if (lock_fd >= 0) {
+			close(lock_fd);
+			lock_fd = -1;
+		}
+	}
+#else
+	(void)shm_name;
+#endif
+}
+
+shm_lifecycle_lock::~shm_lifecycle_lock()
+{
+#if __linux__
+	if (lock_fd >= 0) {
+		(void)flock(lock_fd, LOCK_UN);
+		close(lock_fd);
+	}
+#endif
+}
+
 // Check whether a certain pid was already equipped with syscall tracer
 // Using a set stored in the shared memory
 bool bpftime_shm::check_syscall_trace_setup(int pid)
 {
+	if (syscall_installed_pids == nullptr) {
+		return false;
+	}
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
 	return syscall_installed_pids->contains(pid);
 }
 
@@ -99,106 +256,101 @@ bool bpftime_shm::check_syscall_trace_setup(int pid)
 // Using a set stored in the shared memory
 void bpftime_shm::set_syscall_trace_setup(int pid, bool whether)
 {
-	if (whether) {
-		syscall_installed_pids->insert(pid);
-	} else {
-		syscall_installed_pids->erase(pid);
+	if (syscall_installed_pids == nullptr) {
+		return;
 	}
+	auto update = [&]() {
+		if (whether) {
+			syscall_installed_pids->insert(pid);
+		} else {
+			syscall_installed_pids->erase(pid);
+		}
+	};
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return;
+	}
+	update();
 }
 
-uint32_t bpftime_shm::bpf_map_value_size(int fd) const
-{
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return 0;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.get_userspace_value_size();
-}
-
-const void *bpftime_shm::bpf_map_lookup_elem(int fd, const void *key,
-					     bool from_syscall) const
+const bpf_map_handler *bpftime_shm::try_get_map_handler(int fd) const
 {
 	if (!is_map_fd(fd)) {
 		errno = ENOENT;
 		return nullptr;
 	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.map_lookup_elem(key, from_syscall);
+	return &std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
+}
+
+uint32_t bpftime_shm::bpf_map_value_size(int fd) const
+{
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->get_userspace_value_size() : 0;
+}
+
+const void *bpftime_shm::bpf_map_lookup_elem(int fd, const void *key,
+					     bool from_syscall) const
+{
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->map_lookup_elem(key, from_syscall) : nullptr;
 }
 
 long bpftime_shm::bpf_map_update_elem(int fd, const void *key,
 				      const void *value, uint64_t flags,
 				      bool from_syscall) const
 {
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return -1;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.map_update_elem(key, value, flags, from_syscall);
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->map_update_elem(key, value, flags,
+						  from_syscall) :
+			 -1;
 }
 
 long bpftime_shm::bpf_delete_elem(int fd, const void *key,
 				  bool from_syscall) const
 {
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return -1;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.map_delete_elem(key, from_syscall);
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->map_delete_elem(key, from_syscall) : -1;
 }
 
 long bpftime_shm::bpf_map_push_elem(int fd, const void *value, uint64_t flags,
 				    bool from_syscall) const
 {
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return -1;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.map_push_elem(value, flags, from_syscall);
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->map_push_elem(value, flags, from_syscall) : -1;
 }
 
 long bpftime_shm::bpf_map_pop_elem(int fd, void *value, bool from_syscall) const
 {
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return -1;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.map_pop_elem(value, from_syscall);
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->map_pop_elem(value, from_syscall) : -1;
+}
+
+long bpftime_shm::bpf_map_lookup_and_delete_elem(int fd, const void *key,
+						 void *value,
+						 bool from_syscall) const
+{
+	auto *handler = try_get_map_handler(fd);
+	return handler ?
+		       handler->map_lookup_and_delete_elem(key, value,
+							   from_syscall) :
+		       -1;
 }
 
 long bpftime_shm::bpf_map_peek_elem(int fd, void *value,
 				    bool from_syscall) const
 {
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return -1;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.map_peek_elem(value, from_syscall);
+	auto *handler = try_get_map_handler(fd);
+	return handler ? handler->map_peek_elem(value, from_syscall) : -1;
 }
 
 int bpftime_shm::bpf_map_get_next_key(int fd, const void *key, void *next_key,
 				      bool from_syscall) const
 {
-	if (!is_map_fd(fd)) {
-		errno = ENOENT;
-		return -1;
-	}
-	auto &handler =
-		std::get<bpftime::bpf_map_handler>(manager->get_handler(fd));
-	return handler.bpf_map_get_next_key(key, next_key, from_syscall);
+	auto *handler = try_get_map_handler(fd);
+	return handler ?
+		       handler->bpf_map_get_next_key(key, next_key,
+						     from_syscall) :
+		       -1;
 }
 
 int bpftime_shm::add_kprobe(std::optional<int> fd, const char *func_name,
@@ -283,7 +435,6 @@ int bpftime_shm::add_software_perf_event(int fd, int cpu, int32_t sample_type,
 				    bpftime::bpf_perf_event_handler(
 					    cpu, sample_type, config, segment),
 				    segment);
-	return fd;
 }
 
 int bpftime_shm::attach_perf_to_bpf(int perf_fd, int bpf_fd,
@@ -401,7 +552,7 @@ int bpftime_shm::add_ringbuf_to_epoll(int ringbuf_fd, int epoll_fd,
 		std::get<bpf_map_handler>(manager->get_handler(ringbuf_fd));
 
 	auto ringbuf_map_impl = map_inst.try_get_ringbuf_map_impl();
-	if (ringbuf_map_impl.has_value(); auto val = ringbuf_map_impl.value()) {
+	if (auto val = ringbuf_map_impl.value_or(nullptr)) {
 		epoll_inst.files.emplace_back(val->create_impl_weak_ptr(),
 					      extra_data);
 		SPDLOG_DEBUG("Ringbuf {} added to epoll {}", ringbuf_fd,
@@ -417,10 +568,24 @@ int bpftime_shm::add_ringbuf_to_epoll(int ringbuf_fd, int epoll_fd,
 int bpftime_shm::epoll_create()
 {
 	int fd = open_fake_fd();
+	if (fd < 0)
+		return fd;
+	if (epoll_create_at(fd) < 0) {
+		int saved_errno = errno;
+		close(fd);
+		errno = saved_errno;
+		return -1;
+	}
+	return fd;
+}
+
+int bpftime_shm::epoll_create_at(int fd)
+{
 	if (manager->is_allocated(fd)) {
 		SPDLOG_ERROR(
 			"Creating epoll instance, but fd {} is already occupied",
 			fd);
+		errno = EEXIST;
 		return -1;
 	}
 	fd = manager->set_handler(fd, bpftime::epoll_handler(segment), segment);
@@ -548,6 +713,15 @@ int bpftime_shm::open_fake_fd()
 	while (fd <= 2 && fd >= 0 && --cnt > 0) {
 		fd = dup(fd);
 	}
+	if (fd < 0) {
+		// open/dup failed; errno is already set by libc.
+		return -errno;
+	}
+	if ((std::size_t)fd >= manager->size()) {
+		SPDLOG_ERROR("open_fake_fd: fd {} exceeds handler pool size {}", fd, manager->size());
+		close(fd);
+		return -ENOSPC;
+	}
 	return fd;
 }
 
@@ -572,13 +746,42 @@ int bpftime_shm::add_bpf_prog(int fd, const ebpf_inst *insn, size_t insn_cnt,
 // add a bpf link fd
 int bpftime_shm::add_bpf_link(int fd, struct bpf_link_create_args *args)
 {
+	if (!args) {
+		errno = EINVAL;
+		return -1;
+	}
+	// Validate before allocating an fd so error paths don't leak the fd that
+	// open_fake_fd() would otherwise create.
+	if (!is_prog_fd(args->prog_fd)) {
+		errno = EBADF;
+		return -1;
+	}
+	// For perf-event links (uprobe/kprobe/tracepoint) the target must be a
+	// valid perf-event handler fd, matching the kernel's BPF_LINK_CREATE
+	// validation. Without this a stale/non-perf target_fd would be silently
+	// accepted.
+	if (args->attach_type == BPFTIME_BPF_PERF_EVENT_ATTACH_TYPE &&
+	    !is_perf_event_handler_fd(args->target_fd)) {
+		int target_fd_for_log =
+			args->target_fd == static_cast<uint32_t>(-1) ?
+				-1 :
+				static_cast<int>(args->target_fd);
+		// libbpf probes perf-link support with target_fd=-1 and expects
+		// EBADF, so don't report that expected probe as an error.
+		if (args->target_fd == static_cast<uint32_t>(-1)) {
+			SPDLOG_DEBUG(
+				"add_bpf_link: rejecting expected libbpf perf-link probe with target_fd -1");
+		} else {
+			SPDLOG_ERROR(
+				"add_bpf_link: target_fd {} is not a perf-event handler for BPF_PERF_EVENT link",
+				target_fd_for_log);
+		}
+		errno = EBADF;
+		return -1;
+	}
 	if (fd < 0) {
 		// if fd is negative, we need to create a new fd for allocating
 		fd = open_fake_fd();
-	}
-	if (!is_prog_fd(args->prog_fd) || !args) {
-		errno = EBADF;
-		return -1;
 	}
 	return manager->set_handler(fd, bpftime::bpf_link_handler(*args),
 				    segment);
@@ -626,7 +829,7 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 	: open_type(type)
 {
 	// Get the config from env because the shared memory is not initialized
-	auto config = construct_agent_config_from_env();
+	auto config = construct_runtime_config_from_env();
 	size_t memory_size = config.shm_memory_size;
 	size_t max_fd_count = config.max_fd_count;
 	if (type == shm_open_type::SHM_OPEN_ONLY) {
@@ -634,9 +837,6 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 		// open the shm
 		segment = boost::interprocess::managed_shared_memory(
 			boost::interprocess::open_only, shm_name);
-#ifdef BPFTIME_ENABLE_CUDA_ATTACH
-		register_cuda_host_memory();
-#endif
 		manager = segment.find<bpftime::handler_manager>(
 					 bpftime::DEFAULT_GLOBAL_HANDLER_NAME)
 				  .first;
@@ -644,8 +844,8 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 			segment.find<syscall_pid_set>(
 				       DEFAULT_SYSCALL_PID_SET_NAME)
 				.first;
-		agent_config =
-			segment.find<struct agent_config>(
+		runtime_config =
+			segment.find<struct runtime_config>(
 				       bpftime::DEFAULT_AGENT_CONFIG_NAME)
 				.first;
 
@@ -653,15 +853,35 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 			segment.find<alive_agent_pids>(
 				       bpftime::DEFAULT_ALIVE_AGENT_PIDS_NAME)
 				.first;
+		alive_syscall_server_pids =
+			segment.find<alive_syscall_server_pid_set>(
+				       bpftime::DEFAULT_ALIVE_SYSCALL_SERVER_PIDS_NAME)
+				.first;
+		pid_set_lock =
+			segment.find<boost::interprocess::interprocess_mutex>(
+				       bpftime::DEFAULT_PID_SET_LOCK_NAME)
+				.first;
+		epoch_state = segment.find<bpftime_global_epoch_state>(
+					     "bpftime_global_epoch_state")
+				      .first;
+		cpu_exec_locks = segment.find<bpftime_cpu_exec_locks>(
+					 "bpftime_cpu_exec_locks")
+				  .first;
 		SPDLOG_DEBUG("done: bpftime_shm for client setup");
-	} else if (type == shm_open_type::SHM_CREATE_OR_OPEN) {
+	} else if (type == shm_open_type::SHM_CREATE_OR_OPEN ||
+		   type == shm_open_type::SHM_CREATE_ONLY) {
 		SPDLOG_DEBUG(
 			"start: bpftime_shm for create or open setup for memory size {}",
 			memory_size);
-		segment = boost::interprocess::managed_shared_memory(
-			boost::interprocess::open_or_create,
-			// Allocate 20M bytes of memory by default
-			shm_name, memory_size << 20);
+		if (type == shm_open_type::SHM_CREATE_ONLY) {
+			segment = boost::interprocess::managed_shared_memory(
+				boost::interprocess::create_only, shm_name,
+				memory_size << 20);
+		} else {
+			segment = boost::interprocess::managed_shared_memory(
+				boost::interprocess::open_or_create, shm_name,
+				memory_size << 20);
+		}
 
 		manager = segment.find_or_construct<bpftime::handler_manager>(
 			bpftime::DEFAULT_GLOBAL_HANDLER_NAME)(segment,
@@ -677,7 +897,7 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 		SPDLOG_DEBUG(
 			"done: bpftime_shm for server setup: syscall_pid_set");
 
-		agent_config = segment.find_or_construct<struct agent_config>(
+		runtime_config = segment.find_or_construct<struct runtime_config>(
 			bpftime::DEFAULT_AGENT_CONFIG_NAME)(config);
 
 		injected_pids = segment.find_or_construct<alive_agent_pids>(
@@ -685,6 +905,22 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 			std::less<int>(),
 			alive_agent_pid_set_allocator(
 				segment.get_segment_manager()));
+		alive_syscall_server_pids =
+			segment.find_or_construct<alive_syscall_server_pid_set>(
+				bpftime::DEFAULT_ALIVE_SYSCALL_SERVER_PIDS_NAME)(
+				std::less<int>(),
+				alive_syscall_server_pid_set_allocator(
+					segment.get_segment_manager()));
+		pid_set_lock =
+			segment.find_or_construct<
+				boost::interprocess::interprocess_mutex>(
+				bpftime::DEFAULT_PID_SET_LOCK_NAME)();
+		epoch_state =
+			segment.find_or_construct<bpftime_global_epoch_state>(
+				"bpftime_global_epoch_state")();
+		cpu_exec_locks =
+			segment.find_or_construct<bpftime_cpu_exec_locks>(
+				"bpftime_cpu_exec_locks")();
 		SPDLOG_DEBUG("done: bpftime_shm for open_or_create setup");
 	} else if (type == shm_open_type::SHM_REMOVE_AND_CREATE) {
 		SPDLOG_DEBUG(
@@ -713,16 +949,30 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 		SPDLOG_DEBUG(
 			"done: bpftime_shm for server setup: syscall_pid_set");
 
-		agent_config = segment.construct<struct agent_config>(
+		runtime_config = segment.construct<struct runtime_config>(
 			bpftime::DEFAULT_AGENT_CONFIG_NAME)(config);
 		SPDLOG_DEBUG(
-			"done: bpftime_shm for server setup: agent_config");
+			"done: bpftime_shm for server setup: runtime_config");
 
 		injected_pids = segment.construct<alive_agent_pids>(
 			bpftime::DEFAULT_ALIVE_AGENT_PIDS_NAME)(
 			std::less<int>(),
 			alive_agent_pid_set_allocator(
 				segment.get_segment_manager()));
+		alive_syscall_server_pids =
+			segment.construct<alive_syscall_server_pid_set>(
+				bpftime::DEFAULT_ALIVE_SYSCALL_SERVER_PIDS_NAME)(
+				std::less<int>(),
+				alive_syscall_server_pid_set_allocator(
+					segment.get_segment_manager()));
+		pid_set_lock =
+			segment.construct<
+				boost::interprocess::interprocess_mutex>(
+				bpftime::DEFAULT_PID_SET_LOCK_NAME)();
+		epoch_state = segment.construct<bpftime_global_epoch_state>(
+			"bpftime_global_epoch_state")();
+		cpu_exec_locks = segment.construct<bpftime_cpu_exec_locks>(
+			"bpftime_cpu_exec_locks")();
 		SPDLOG_DEBUG("done: bpftime_shm for server setup.");
 	} else if (type == shm_open_type::SHM_NO_CREATE) {
 		// not create any shm
@@ -731,10 +981,16 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 		return;
 	}
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
-// Move CommSharedMem from the agent’s local memory to shared memory to improve performance.
+	// Move CommSharedMem from the agent’s local memory to shared memory to
+	// improve performance.
 	if (open_type == shm_open_type::SHM_OPEN_ONLY) {
-		auto pair =
-			segment.find<cuda::CommSharedMem>("cuda_comm_shared_mem");
+		auto pair = segment.find<cuda::CommSharedMem>(
+			"cuda_comm_shared_mem");
+		for (int i = 0; pair.first == nullptr && i < 100; i++) {
+			usleep(10000);
+			pair = segment.find<cuda::CommSharedMem>(
+				"cuda_comm_shared_mem");
+		}
 		if (pair.first == nullptr) {
 			SPDLOG_ERROR(
 				"CommSharedMem not found in shared memory; did syscall-server initialize CUDA support?");
@@ -742,9 +998,14 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 		} else {
 			cuda_comm_shared_mem = pair.first;
 		}
+		// Register the shared communication memory for CUDA device
+		// mapping. This must happen after we have located the
+		// CommSharedMem in the shared segment.
+		if (cuda_comm_shared_mem != nullptr)
+			register_cuda_host_memory();
 	} else {
-		auto pair =
-			segment.find<cuda::CommSharedMem>("cuda_comm_shared_mem");
+		auto pair = segment.find<cuda::CommSharedMem>(
+			"cuda_comm_shared_mem");
 		if (pair.first != nullptr) {
 			cuda_comm_shared_mem = pair.first;
 		} else {
@@ -759,7 +1020,7 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 		}
 	}
 #endif
-	// local_agent_config.emplace(segment);
+	// local_runtime_config.emplace(segment);
 
 #if BPFTIME_ENABLE_MPK
 	// init mpk key
@@ -779,19 +1040,114 @@ bpftime_shm::bpftime_shm(const char *shm_name, shm_open_type type)
 #endif
 }
 
+void bpftime_shm::lock_bpf_cpu(int cpu)
+{
+	if (cpu_exec_locks != nullptr && cpu >= 0 && cpu < BPFTIME_MAX_CPU_COUNT)
+		cpu_exec_locks->locks[cpu].lock();
+}
+
+void bpftime_shm::unlock_bpf_cpu(int cpu)
+{
+	if (cpu_exec_locks == nullptr || cpu < 0 ||
+	    cpu >= BPFTIME_MAX_CPU_COUNT)
+		return;
+	try {
+		cpu_exec_locks->locks[cpu].unlock();
+	} catch (const std::exception &ex) {
+		SPDLOG_WARN("Unable to unlock bpftime cpu {} lock: {}", cpu,
+			    ex.what());
+	} catch (...) {
+		SPDLOG_WARN("Unable to unlock bpftime cpu {} lock", cpu);
+	}
+}
+
+bool bpftime_shm::acquire_bpf_cpu(int cpu)
+{
+	if (cpu_exec_locks == nullptr || cpu < 0 ||
+	    cpu >= BPFTIME_MAX_CPU_COUNT)
+		return false;
+	// Preserve the blocking serialization semantics of lock(): per-CPU
+	// correctness requires waiting for a normally-held lock even under
+	// contention, so a fixed timeout would spuriously skip valid BPF
+	// execution. The host-safety fix here is to contain locking
+	// exceptions, which otherwise propagate through the Frida C trampoline
+	// into std::terminate. A non-robust mutex whose owner died while
+	// holding it is a separate robustness concern that needs a robust
+	// mutex, not a timeout that also breaks ordinary contention.
+	try {
+		cpu_exec_locks->locks[cpu].lock();
+		return true;
+	} catch (const std::exception &ex) {
+		SPDLOG_WARN("Unable to lock bpftime cpu {}: {}", cpu,
+			    ex.what());
+		return false;
+	} catch (...) {
+		SPDLOG_WARN("Unable to lock bpftime cpu {}", cpu);
+		return false;
+	}
+}
+
+std::uint64_t bpftime_shm::read_stable_epoch_seq(int max_tries) const
+{
+	if (!epoch_state)
+		return BPFTIME_EPOCH_SEQ_MISSING;
+	for (int i = 0; i < max_tries; i++) {
+		std::uint64_t a = __atomic_load_n(&epoch_state->epoch_seq,
+						  __ATOMIC_ACQUIRE);
+		if (a & 1U) {
+			// Writer in progress.
+			usleep(1000);
+			continue;
+		}
+		std::uint64_t b = __atomic_load_n(&epoch_state->epoch_seq,
+						  __ATOMIC_ACQUIRE);
+		if (a == b)
+			return a;
+	}
+	return BPFTIME_EPOCH_SEQ_UNSTABLE;
+}
+
+std::uint64_t bpftime_shm::begin_new_session()
+{
+	if (!epoch_state) {
+		SPDLOG_WARN("begin_new_session: epoch_state missing");
+		reset_server_state();
+		return 0;
+	}
+	// Mark updating (odd).
+	__atomic_add_fetch(&epoch_state->epoch_seq, 1, __ATOMIC_ACQ_REL);
+	reset_server_state();
+	// Mark stable (even).
+	std::uint64_t seq = __atomic_add_fetch(&epoch_state->epoch_seq, 1,
+					       __ATOMIC_ACQ_REL);
+	return seq;
+}
+
 bpftime_shm::bpftime_shm(bpftime::shm_open_type type)
 	: bpftime_shm(bpftime::get_global_shm_name(), type)
 {
 	SPDLOG_INFO("Global shm constructed. shm_open_type {} for {}",
 		    (int)type, bpftime::get_global_shm_name());
 }
-
+int bpftime_shm::translate_shared_map_type_to_kernel_map_type(int type)
+{
+	if (type ==
+	    (int)bpf_map_type::BPF_MAP_TYPE_GPU_KERNEL_SHARED_ARRAY_MAP) {
+		return (int)bpf_map_type::BPF_MAP_TYPE_ARRAY;
+	} else {
+		return type;
+	}
+}
 int bpftime_shm::add_bpf_map(int fd, const char *name,
 			     bpftime::bpf_map_attr attr)
 {
+	bool fd_self_allocated = false;
 	if (fd < 0) {
 		// if fd is negative, we need to create a new fd for allocating
 		fd = open_fake_fd();
+		fd_self_allocated = true;
+		if (fd < 0)
+			return fd;
 	}
 	if (!manager) {
 		return -1;
@@ -813,8 +1169,14 @@ int bpftime_shm::add_bpf_map(int fd, const char *name,
 			"Creating map handler at {}, which must destroy the existing handler");
 		manager->clear_id_at(fd, segment);
 	}
-	return manager->set_handler(
+	int rc = manager->set_handler(
 		fd, bpftime::bpf_map_handler(fd, name, segment, attr), segment);
+	if (rc < 0 && fd_self_allocated) {
+		// set_handler already rolled back the handler slot; close the OS
+		// fd allocated in this call so failed creates do not leak fds.
+		close(fd);
+	}
+	return rc;
 }
 
 int bpftime_shm::dup_bpf_map(int oldfd, int newfd)
@@ -835,7 +1197,10 @@ int bpftime_shm::dup_bpf_map(int oldfd, int newfd)
 	// Get the original map handler
 	auto &handler =
 		std::get<bpftime::bpf_map_handler>(manager->get_handler(oldfd));
-	std::string new_name = std::string("dup_") + handler.name.c_str();
+	// A dup(2)'d fd should reference the same underlying map. Keep the same
+	// map name when possible so we can share the same container in shm.
+	std::string shared_name = handler.name.c_str();
+	std::string fallback_name = std::string("dup_") + handler.name.c_str();
 	// Destroy old handler
 	auto &old_handler = manager->get_handler(newfd);
 	if (!std::holds_alternative<unused_handler>(old_handler)) {
@@ -843,12 +1208,22 @@ int bpftime_shm::dup_bpf_map(int oldfd, int newfd)
 
 		manager->clear_id_at(newfd, segment);
 	}
-	// Create a new handler with the same parameters
+
+	if (handler.can_share_map_impl()) {
+		bpftime::bpf_map_handler dup_handler(newfd, shared_name.c_str(),
+						     segment, handler.attr);
+		dup_handler.share_map_impl_from(handler);
+		handler.inc_map_refcount();
+		return manager->set_handler(newfd, std::move(dup_handler),
+					    segment);
+	}
+
+	// Fallback: create an independent map if the source map doesn't support
+	// sharing (e.g. legacy shm objects).
 	return manager->set_handler(
 		newfd,
-		bpftime::bpf_map_handler(newfd, new_name.c_str(), segment,
-					 handler.attr), // Copy construct the
-							// handler
+		bpftime::bpf_map_handler(newfd, fallback_name.c_str(), segment,
+					 handler.attr),
 		segment);
 }
 
@@ -877,36 +1252,36 @@ bool bpftime_shm::is_software_perf_event_handler_fd(int fd) const
 
 // local agent config can be used for test or local process
 
-void bpftime_shm::set_agent_config(struct agent_config &&config)
+void bpftime_shm::set_runtime_config(struct runtime_config &&config)
 {
-	if (agent_config == nullptr) {
+	if (runtime_config == nullptr) {
 		SPDLOG_INFO(
-			"global agent_config is nullptr, set current process config");
-		local_agent_config.emplace(std::move(config));
+			"global runtime_config is nullptr, set current process config");
+		local_runtime_config.emplace(std::move(config));
 		return;
 	}
 
-	agent_config->~agent_config();
-	std::construct_at(agent_config, std::move(config));
+	runtime_config->~runtime_config();
+	std::construct_at(runtime_config, std::move(config));
 }
 
-const struct agent_config &bpftime_shm::get_agent_config()
+const struct runtime_config &bpftime_shm::get_runtime_config()
 {
-	if (agent_config == nullptr) {
+	if (runtime_config == nullptr) {
 		SPDLOG_DEBUG("use current process config");
-		return *local_agent_config;
+		return *local_runtime_config;
 	}
-	return *agent_config;
+	return *runtime_config;
 }
 
-const bpftime::agent_config &bpftime_get_agent_config()
+const bpftime::runtime_config &bpftime_get_runtime_config()
 {
-	return shm_holder.global_shared_memory.get_agent_config();
+	return shm_holder.global_shared_memory.get_runtime_config();
 }
 
-void bpftime_set_agent_config(bpftime::agent_config &&cfg)
+void bpftime_set_runtime_config(bpftime::runtime_config &&cfg)
 {
-	shm_holder.global_shared_memory.set_agent_config(std::move(cfg));
+	shm_holder.global_shared_memory.set_runtime_config(std::move(cfg));
 }
 
 std::optional<void *>
@@ -941,6 +1316,15 @@ bool bpftime_shm::register_cuda_host_memory()
 		return false;
 	}
 
+	const auto prefault_range = [](void *addr, std::size_t size) {
+		constexpr std::size_t kPageSize = 4096;
+		volatile unsigned char sink = 0;
+		auto *p = static_cast<volatile unsigned char *>(addr);
+		for (std::size_t i = 0; i < size; i += kPageSize) {
+			sink ^= p[i];
+		}
+	};
+
 	// Ensure we can map host memory into device address space
 	cudaError_t flag_err = cudaSetDeviceFlags(cudaDeviceMapHost);
 	if (flag_err != cudaSuccess &&
@@ -956,10 +1340,11 @@ bool bpftime_shm::register_cuda_host_memory()
 	// 1. Get the base address and size of the Boost.Interprocess segment
 	void *base_addr = segment.get_address(); // Starting address
 	std::size_t seg_size = segment.get_size(); // Total bytes in segment
+	prefault_range(base_addr, seg_size);
 
 	// 2. Register with CUDA
-    cudaError_t err =
-        cudaHostRegister(base_addr, seg_size, cudaHostRegisterMapped);
+	cudaError_t err =
+		cudaHostRegister(base_addr, seg_size, cudaHostRegisterMapped);
 	if (err != cudaSuccess) {
 		SPDLOG_ERROR("cudaHostRegister() failed: {}",
 			     cudaGetErrorString(err));
@@ -968,6 +1353,7 @@ bool bpftime_shm::register_cuda_host_memory()
 
 	SPDLOG_INFO("Registered shared memory with CUDA: addr={} size={}",
 		    base_addr, seg_size);
+	cuda_host_memory_registered = true;
 	return true;
 }
 #endif
@@ -979,6 +1365,9 @@ bpftime::bpftime_shm::~bpftime_shm()
 
 	void *base_addr = segment.get_address();
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
+	if (!cuda_host_memory_registered) {
+		return;
+	}
 	cudaError_t err = cudaHostUnregister(base_addr);
 	// Use fprintf here to avoid spdlog de-initialized issues
 	if (err != cudaSuccess) {
@@ -997,19 +1386,116 @@ bpftime::bpftime_shm::~bpftime_shm()
 #endif
 }
 
-void bpftime_shm::add_pid_into_alive_agent_set(int pid)
+bool bpftime_shm::add_pid_into_alive_agent_set(int pid)
 {
-	injected_pids->insert(pid);
+	if (injected_pids == nullptr) {
+		return true;
+	}
+	auto update = [&]() { injected_pids->insert(pid); };
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	update();
+	return true;
 }
-void bpftime_shm::remove_pid_from_alive_agent_set(int pid)
+bool bpftime_shm::remove_pid_from_alive_agent_set(int pid)
 {
-	injected_pids->erase(pid);
+	if (injected_pids == nullptr) {
+		return true;
+	}
+	auto update = [&]() { injected_pids->erase(pid); };
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	update();
+	return true;
 }
-void bpftime_shm::iterate_all_pids_in_alive_agent_set(
+bool bpftime_shm::iterate_all_pids_in_alive_agent_set(
 	std::function<void(int)> &&cb)
 {
-	for (auto x : *injected_pids) {
+	std::vector<int> pids;
+	auto snapshot = [&]() {
+		if (injected_pids != nullptr) {
+			pids.assign(injected_pids->begin(), injected_pids->end());
+		}
+	};
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	snapshot();
+	for (auto x : pids) {
 		cb(x);
+	}
+	return true;
+}
+
+bool bpftime_shm::add_pid_into_alive_syscall_server_set(int pid)
+{
+	if (alive_syscall_server_pids == nullptr) {
+		return true;
+	}
+	auto update = [&]() { alive_syscall_server_pids->insert(pid); };
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	update();
+	return true;
+}
+
+bool bpftime_shm::remove_pid_from_alive_syscall_server_set(int pid)
+{
+	if (alive_syscall_server_pids == nullptr) {
+		return true;
+	}
+	auto update = [&]() { alive_syscall_server_pids->erase(pid); };
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	update();
+	return true;
+}
+
+bool bpftime_shm::iterate_all_pids_in_alive_syscall_server_set(
+	std::function<void(int)> &&cb)
+{
+	std::vector<int> pids;
+	auto snapshot = [&]() {
+		if (alive_syscall_server_pids != nullptr) {
+			pids.assign(alive_syscall_server_pids->begin(),
+				    alive_syscall_server_pids->end());
+		}
+	};
+	pid_set_scoped_lock lock(pid_set_lock);
+	if (!lock.owns_lock()) {
+		return false;
+	}
+	snapshot();
+	for (auto x : pids) {
+		cb(x);
+	}
+	return true;
+}
+
+void bpftime_shm::reset_server_state()
+{
+	if (manager == nullptr) {
+		return;
+	}
+	manager->clear_all(segment);
+	if (syscall_installed_pids != nullptr) {
+		auto clear_syscall_pids = [&]() {
+			syscall_installed_pids->clear();
+		};
+		pid_set_scoped_lock lock(pid_set_lock);
+		if (!lock.owns_lock()) {
+			return;
+		}
+		clear_syscall_pids();
 	}
 }
 #ifdef BPFTIME_ENABLE_CUDA_ATTACH
